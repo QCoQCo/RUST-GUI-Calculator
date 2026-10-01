@@ -47,12 +47,19 @@ const MAX_INPUT_DIGITS: usize = 15;
 const SCIENTIFIC_UPPER: f64 = 1e15;
 const SCIENTIFIC_LOWER: f64 = 1e-7;
 
+// 레이아웃 크기
+const BUTTON_WIDTH: f32 = 100.0;
+const BUTTON_HEIGHT: f32 = 75.0;
+const SPACING: u16 = 10;
+const GRID_WIDTH: f32 = BUTTON_WIDTH * 4.0 + SPACING as f32 * 3.0;
+
 struct Calculator {
     display: String,               // 현재 표시할 값
     previous_value: Option<f64>,   // 이전 값
     operator: Option<Operator>,    // 현재 연산자
     waiting_for_operand: bool,     // 다음 숫자 입력 시 새로 시작하는지
     operator_just_pressed: bool,   // 직전 입력이 연산자였는지
+    error: bool,                   // 에러 상태인지 (0으로 나누기, 오버플로)
 }
 
 impl Calculator {
@@ -63,20 +70,21 @@ impl Calculator {
         self.operator = None;
         self.waiting_for_operand = false;
         self.operator_just_pressed = false;
+        self.error = false;
+    }
+
+    // 화면에 보여줄 문자열
+    fn display_text(&self) -> &str {
+        if self.error {
+            "Error"
+        } else {
+            &self.display
+        }
     }
 
     // 디스플레이 값을 숫자로 변환
     fn get_display_value(&self) -> f64 {
-        // Error 상태이면 0.0 반환
-        if self.display == "Error" {
-            return 0.0;
-        }
         self.display.parse().unwrap_or(0.0)
-    }
-
-    // Error 상태인지 확인
-    fn is_error(&self) -> bool {
-        self.display == "Error"
     }
 
     // 디스플레이 업데이트 (숫자 포맷팅)
@@ -87,7 +95,7 @@ impl Calculator {
     // 숫자 입력 처리
     fn input_number(&mut self, digit: char) {
         // Error 상태이면 초기화
-        if self.is_error() {
+        if self.error {
             self.clear();
         }
         
@@ -104,7 +112,7 @@ impl Calculator {
     // 소수점 입력 처리
     fn input_decimal(&mut self) {
         // Error 상태이면 초기화
-        if self.is_error() {
+        if self.error {
             self.clear();
         }
         
@@ -119,7 +127,7 @@ impl Calculator {
     // 연산자 입력 처리
     fn input_operator(&mut self, op: Operator) {
         // Error 상태이면 연산자 입력 무시
-        if self.is_error() {
+        if self.error {
             return;
         }
 
@@ -134,12 +142,12 @@ impl Calculator {
         if let Some(prev_op) = self.operator {
             // 이전 연산자가 있으면 먼저 계산 실행
             if let Some(prev_val) = self.previous_value {
-                let result = self.calculate(prev_val, prev_op, current_value);
-                self.update_display(result);
                 // Error가 발생하면 연산자 설정하지 않음
-                if self.is_error() {
+                let Some(result) = calculate(prev_val, prev_op, current_value) else {
+                    self.error = true;
                     return;
-                }
+                };
+                self.update_display(result);
                 self.previous_value = Some(result);
             }
         } else {
@@ -151,40 +159,23 @@ impl Calculator {
         self.waiting_for_operand = true;
     }
 
-    // 계산 실행
-    fn calculate(&self, left: f64, op: Operator, right: f64) -> f64 {
-        match op {
-            Operator::Add => left + right,
-            Operator::Subtract => left - right,
-            Operator::Multiply => left * right,
-            Operator::Divide => {
-                if right == 0.0 {
-                    f64::INFINITY // 0으로 나누기 에러
-                } else {
-                    left / right
-                }
-            }
-        }
-    }
-
     // 계산 실행 (= 버튼)
     fn execute_calculation(&mut self) {
         // Error 상태이면 계산 실행 무시
-        if self.is_error() {
+        if self.error {
             return;
         }
         
-        if let Some(op) = self.operator {
-            if let Some(prev_val) = self.previous_value {
-                let current_value = self.get_display_value();
-                let result = self.calculate(prev_val, op, current_value);
-                self.update_display(result);
-                // Error가 발생하지 않았을 때만 상태 업데이트
-                if !self.is_error() {
+        if let (Some(op), Some(prev_val)) = (self.operator, self.previous_value) {
+            let current_value = self.get_display_value();
+            match calculate(prev_val, op, current_value) {
+                Some(result) => {
+                    self.update_display(result);
                     self.previous_value = None;
                     self.operator = None;
                     self.waiting_for_operand = true;
                 }
+                None => self.error = true,
             }
         }
     }
@@ -192,7 +183,7 @@ impl Calculator {
     // 부호 변경 (±)
     fn toggle_sign(&mut self) {
         // Error 상태이면 무시
-        if self.is_error() {
+        if self.error {
             return;
         }
         
@@ -207,7 +198,7 @@ impl Calculator {
     // 퍼센트 계산 (%)
     fn calculate_percent(&mut self) {
         // Error 상태이면 무시
-        if self.is_error() {
+        if self.error {
             return;
         }
         
@@ -218,12 +209,25 @@ impl Calculator {
     }
 }
 
-// 숫자를 디스플레이용 문자열로 변환
+// 계산 실행 (0으로 나누기, 오버플로 시 None)
+fn calculate(left: f64, op: Operator, right: f64) -> Option<f64> {
+    let result = match op {
+        Operator::Add => left + right,
+        Operator::Subtract => left - right,
+        Operator::Multiply => left * right,
+        Operator::Divide => {
+            if right == 0.0 {
+                return None;
+            }
+            left / right
+        }
+    };
+    Some(result).filter(|r| r.is_finite())
+}
+
+// 숫자를 디스플레이용 문자열로 변환 (유한한 값만 받음)
 fn format_number(value: f64) -> String {
-    // 무한대나 NaN 체크
-    if value.is_infinite() || value.is_nan() {
-        return "Error".to_string();
-    }
+    debug_assert!(value.is_finite(), "유한하지 않은 값: {value}");
 
     // -0.0도 "0"으로 표시
     if value == 0.0 {
@@ -270,6 +274,7 @@ impl Application for Calculator {
                 operator: None,
                 waiting_for_operand: false,
                 operator_just_pressed: false,
+                error: false,
             },
             Command::none(),
         )
@@ -314,15 +319,21 @@ impl Application for Calculator {
 
     fn view(&self) -> Element<'_, Message> {
         // 메인 컬럼: 디스플레이 + 버튼 그리드
-        column![
+        let content = column![
             // 디스플레이 영역
-            display_area(&self.display),
+            display_area(self.display_text()),
             // 버튼 그리드
             button_grid()
         ]
-        .spacing(10)
-        .padding(20)
-        .into()
+        .spacing(SPACING);
+
+        // 창 크기가 바뀌어도 계산기를 가운데에 배치
+        container(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x()
+            .center_y()
+            .into()
     }
 
     fn theme(&self) -> Theme {
@@ -363,7 +374,7 @@ fn display_area(value: &str) -> Element<'_, Message> {
             .width(Length::Fill)
             .horizontal_alignment(iced::alignment::Horizontal::Right),
     )
-    .width(Length::Fill)
+    .width(Length::Fixed(GRID_WIDTH))
     .height(Length::Fixed(120.0))
     .padding(20)
     .style(iced::theme::Container::Custom(Box::new(DisplayStyle)))
@@ -455,7 +466,7 @@ fn button_grid() -> Element<'static, Message> {
             calc_button("%", ButtonType::Percent, ButtonStyleType::Function),
             calc_button("÷", ButtonType::Operator(Operator::Divide), ButtonStyleType::Operator),
         ]
-        .spacing(10),
+        .spacing(SPACING),
         // 두 번째 행: 7, 8, 9, ×
         row![
             calc_button("7", ButtonType::Number('7'), ButtonStyleType::Number),
@@ -463,7 +474,7 @@ fn button_grid() -> Element<'static, Message> {
             calc_button("9", ButtonType::Number('9'), ButtonStyleType::Number),
             calc_button("×", ButtonType::Operator(Operator::Multiply), ButtonStyleType::Operator),
         ]
-        .spacing(10),
+        .spacing(SPACING),
         // 세 번째 행: 4, 5, 6, -
         row![
             calc_button("4", ButtonType::Number('4'), ButtonStyleType::Number),
@@ -471,7 +482,7 @@ fn button_grid() -> Element<'static, Message> {
             calc_button("6", ButtonType::Number('6'), ButtonStyleType::Number),
             calc_button("-", ButtonType::Operator(Operator::Subtract), ButtonStyleType::Operator),
         ]
-        .spacing(10),
+        .spacing(SPACING),
         // 네 번째 행: 1, 2, 3, +
         row![
             calc_button("1", ButtonType::Number('1'), ButtonStyleType::Number),
@@ -479,17 +490,17 @@ fn button_grid() -> Element<'static, Message> {
             calc_button("3", ButtonType::Number('3'), ButtonStyleType::Number),
             calc_button("+", ButtonType::Operator(Operator::Add), ButtonStyleType::Operator),
         ]
-        .spacing(10),
-        // 다섯 번째 행: 0 (넓게), ., =
+        .spacing(SPACING),
+        // 다섯 번째 행: 0 (버튼 2칸 + 간격), ., =
         row![
             calc_button("0", ButtonType::Number('0'), ButtonStyleType::Number)
-                .width(Length::Fill),
+                .width(Length::Fixed(BUTTON_WIDTH * 2.0 + SPACING as f32)),
             calc_button(".", ButtonType::Decimal, ButtonStyleType::Number),
             calc_button("=", ButtonType::Equals, ButtonStyleType::Equals),
         ]
-        .spacing(10),
+        .spacing(SPACING),
     ]
-    .spacing(10)
+    .spacing(SPACING)
     .into()
 }
 
@@ -499,9 +510,17 @@ fn calc_button<'a>(
     button_type: ButtonType,
     style_type: ButtonStyleType,
 ) -> button::Button<'a, Message> {
-    button(text(label).size(28))
-        .width(Length::Fixed(100.0))
-        .height(Length::Fixed(75.0))
+    // 라벨을 버튼 가운데에 배치
+    let label = text(label)
+        .size(28)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .horizontal_alignment(iced::alignment::Horizontal::Center)
+        .vertical_alignment(iced::alignment::Vertical::Center);
+
+    button(label)
+        .width(Length::Fixed(BUTTON_WIDTH))
+        .height(Length::Fixed(BUTTON_HEIGHT))
         .style(iced::theme::Button::Custom(Box::new(ButtonStyle {
             style_type,
         })))
@@ -540,7 +559,7 @@ mod tests {
     fn display_after(keys: &str) -> String {
         let mut calc = new_calc();
         press(&mut calc, keys);
-        calc.display
+        calc.display_text().to_string()
     }
 
     // ===== 기존 동작 (회귀 방지) =====
@@ -709,13 +728,51 @@ mod tests {
         assert_eq!(format_number(1e15), "1e15");
         assert_eq!(format_number(-1e-11), "-1e-11");
         assert_eq!(format_number(1.23456789e-8), "1.23456789e-8");
-        assert_eq!(format_number(f64::INFINITY), "Error");
-        assert_eq!(format_number(f64::NAN), "Error");
     }
 
     // 지수 표기 결과로 이어서 계산할 수 있어야 함
     #[test]
     fn scientific_result_can_be_used_as_operand() {
         assert_eq!(display_after("0.00000001/1000=*1000="), "1e-8");
+    }
+
+    // ===== 에러 상태 (4단계) =====
+
+    #[test]
+    fn calculate_rejects_divide_by_zero_and_overflow() {
+        assert_eq!(calculate(6.0, Operator::Divide, 3.0), Some(2.0));
+        assert_eq!(calculate(1.0, Operator::Divide, 0.0), None);
+        assert_eq!(calculate(f64::MAX, Operator::Multiply, 2.0), None);
+        assert_eq!(calculate(f64::MAX, Operator::Add, f64::MAX), None);
+    }
+
+    #[test]
+    fn overflow_shows_error() {
+        // 약 1e15를 21번 곱하면 약 1e315로 f64 범위(약 1.8e308)를 넘음
+        let operands = vec!["999999999999999"; 21].join("*");
+        assert_eq!(display_after(&format!("{operands}=")), "Error");
+        // 연산자를 누르는 시점에 넘쳐도 Error
+        assert_eq!(display_after(&format!("{operands}*")), "Error");
+    }
+
+    #[test]
+    fn divide_by_zero_mid_chain_shows_error() {
+        assert_eq!(display_after("5/0+"), "Error");
+    }
+
+    #[test]
+    fn inputs_except_digit_and_clear_are_ignored_in_error() {
+        assert_eq!(display_after("5/0=+±%="), "Error");
+    }
+
+    #[test]
+    fn decimal_after_error_starts_fresh() {
+        assert_eq!(display_after("5/0=.5"), "0.5");
+    }
+
+    #[test]
+    fn clear_recovers_from_error() {
+        assert_eq!(display_after("5/0=C"), "0");
+        assert_eq!(display_after("5/0=C2+3="), "5");
     }
 }
