@@ -40,12 +40,19 @@ enum Message {
     ButtonPressed(ButtonType),
 }
 
+// 입력 가능한 최대 자릿수 (f64 정밀도 한계)
+const MAX_INPUT_DIGITS: usize = 15;
+
+// 이 범위를 벗어나는 값은 지수 표기로 표시
+const SCIENTIFIC_UPPER: f64 = 1e15;
+const SCIENTIFIC_LOWER: f64 = 1e-7;
+
 struct Calculator {
-    display: String,              // 현재 표시할 값
-    previous_value: Option<f64>,  // 이전 값
-    operator: Option<Operator>,  // 현재 연산자
-    waiting_for_operand: bool,    // 새 피연산자 입력 대기 중인지
-    has_decimal: bool,           // 현재 입력값에 소수점이 있는지
+    display: String,               // 현재 표시할 값
+    previous_value: Option<f64>,   // 이전 값
+    operator: Option<Operator>,    // 현재 연산자
+    waiting_for_operand: bool,     // 다음 숫자 입력 시 새로 시작하는지
+    operator_just_pressed: bool,   // 직전 입력이 연산자였는지
 }
 
 impl Calculator {
@@ -55,7 +62,7 @@ impl Calculator {
         self.previous_value = None;
         self.operator = None;
         self.waiting_for_operand = false;
-        self.has_decimal = false;
+        self.operator_just_pressed = false;
     }
 
     // 디스플레이 값을 숫자로 변환
@@ -74,22 +81,7 @@ impl Calculator {
 
     // 디스플레이 업데이트 (숫자 포맷팅)
     fn update_display(&mut self, value: f64) {
-        // 무한대나 NaN 체크
-        if value.is_infinite() || value.is_nan() {
-            self.display = "Error".to_string();
-            return;
-        }
-
-        // 소수점이 없고 정수인 경우 정수로 표시
-        if value.fract() == 0.0 {
-            self.display = value.trunc().to_string();
-        } else {
-            // 소수점이 있는 경우 최대 10자리까지 표시
-            self.display = format!("{:.10}", value)
-                .trim_end_matches('0')
-                .trim_end_matches('.')
-                .to_string();
-        }
+        self.display = format_number(value);
     }
 
     // 숫자 입력 처리
@@ -102,13 +94,10 @@ impl Calculator {
         if self.waiting_for_operand {
             self.display = digit.to_string();
             self.waiting_for_operand = false;
-            self.has_decimal = false;
-        } else {
-            if self.display == "0" {
-                self.display = digit.to_string();
-            } else {
-                self.display.push(digit);
-            }
+        } else if self.display == "0" {
+            self.display = digit.to_string();
+        } else if count_digits(&self.display) < MAX_INPUT_DIGITS {
+            self.display.push(digit);
         }
     }
 
@@ -122,10 +111,8 @@ impl Calculator {
         if self.waiting_for_operand {
             self.display = "0.".to_string();
             self.waiting_for_operand = false;
-            self.has_decimal = true;
-        } else if !self.has_decimal {
+        } else if !self.display.contains('.') {
             self.display.push('.');
-            self.has_decimal = true;
         }
     }
 
@@ -133,6 +120,12 @@ impl Calculator {
     fn input_operator(&mut self, op: Operator) {
         // Error 상태이면 연산자 입력 무시
         if self.is_error() {
+            return;
+        }
+
+        // 연산자를 연속으로 누르면 연산자만 교체
+        if self.operator_just_pressed && self.operator.is_some() {
+            self.operator = Some(op);
             return;
         }
         
@@ -156,7 +149,6 @@ impl Calculator {
 
         self.operator = Some(op);
         self.waiting_for_operand = true;
-        self.has_decimal = false;
     }
 
     // 계산 실행
@@ -192,7 +184,6 @@ impl Calculator {
                     self.previous_value = None;
                     self.operator = None;
                     self.waiting_for_operand = true;
-                    self.has_decimal = result.fract() != 0.0;
                 }
             }
         }
@@ -205,9 +196,11 @@ impl Calculator {
             return;
         }
         
-        let value = self.get_display_value();
-        if value != 0.0 {
-            self.update_display(-value);
+        // 문자열에서 부호만 바꿔 입력 중인 형태(예: "1.")를 유지
+        if let Some(positive) = self.display.strip_prefix('-') {
+            self.display = positive.to_string();
+        } else if self.display != "0" {
+            self.display.insert(0, '-');
         }
     }
 
@@ -220,11 +213,47 @@ impl Calculator {
         
         let value = self.get_display_value();
         self.update_display(value / 100.0);
-        // Error가 발생하지 않았을 때만 has_decimal 업데이트
-        if !self.is_error() {
-            self.has_decimal = true;
-        }
+        // 결과 뒤 숫자 입력은 새 입력으로 시작
+        self.waiting_for_operand = true;
     }
+}
+
+// 숫자를 디스플레이용 문자열로 변환
+fn format_number(value: f64) -> String {
+    // 무한대나 NaN 체크
+    if value.is_infinite() || value.is_nan() {
+        return "Error".to_string();
+    }
+
+    // -0.0도 "0"으로 표시
+    if value == 0.0 {
+        return "0".to_string();
+    }
+
+    let abs = value.abs();
+    if abs >= SCIENTIFIC_UPPER || abs < SCIENTIFIC_LOWER {
+        // 지수 표기: 가수 최대 9자리, 끝의 0 제거 (예: 9.9999997e23)
+        let formatted = format!("{:.8e}", value);
+        let (mantissa, exponent) = formatted
+            .split_once('e')
+            .expect("지수 표기에는 항상 'e'가 있음");
+        let mantissa = mantissa.trim_end_matches('0').trim_end_matches('.');
+        format!("{mantissa}e{exponent}")
+    } else if value.fract() == 0.0 {
+        // 정수인 경우 정수로 표시
+        value.to_string()
+    } else {
+        // 소수점이 있는 경우 최대 10자리까지 표시
+        format!("{:.10}", value)
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    }
+}
+
+// 문자열에 포함된 숫자 자릿수 (부호, 소수점 제외)
+fn count_digits(s: &str) -> usize {
+    s.chars().filter(|c| c.is_ascii_digit()).count()
 }
 
 impl Application for Calculator {
@@ -240,7 +269,7 @@ impl Application for Calculator {
                 previous_value: None,
                 operator: None,
                 waiting_for_operand: false,
-                has_decimal: false,
+                operator_just_pressed: false,
             },
             Command::none(),
         )
@@ -253,6 +282,7 @@ impl Application for Calculator {
     fn update(&mut self, message: Message) -> Command<Message> {
         match message {
             Message::ButtonPressed(button_type) => {
+                let is_operator = matches!(button_type, ButtonType::Operator(_));
                 match button_type {
                     ButtonType::Clear => {
                         self.clear();
@@ -276,6 +306,7 @@ impl Application for Calculator {
                         self.calculate_percent();
                     }
                 }
+                self.operator_just_pressed = is_operator;
             }
         }
         Command::none()
@@ -475,4 +506,216 @@ fn calc_button<'a>(
             style_type,
         })))
         .on_press(Message::ButtonPressed(button_type))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_calc() -> Calculator {
+        Calculator::new(()).0
+    }
+
+    // 키 문자열을 버튼 입력으로 변환해 순서대로 누름
+    // 0-9 . + - * / = C ± %
+    fn press(calc: &mut Calculator, keys: &str) {
+        for key in keys.chars() {
+            let button_type = match key {
+                '0'..='9' => ButtonType::Number(key),
+                '.' => ButtonType::Decimal,
+                '+' => ButtonType::Operator(Operator::Add),
+                '-' => ButtonType::Operator(Operator::Subtract),
+                '*' => ButtonType::Operator(Operator::Multiply),
+                '/' => ButtonType::Operator(Operator::Divide),
+                '=' => ButtonType::Equals,
+                'C' => ButtonType::Clear,
+                '±' => ButtonType::Sign,
+                '%' => ButtonType::Percent,
+                _ => panic!("알 수 없는 키: {key}"),
+            };
+            let _ = calc.update(Message::ButtonPressed(button_type));
+        }
+    }
+
+    fn display_after(keys: &str) -> String {
+        let mut calc = new_calc();
+        press(&mut calc, keys);
+        calc.display
+    }
+
+    // ===== 기존 동작 (회귀 방지) =====
+
+    #[test]
+    fn adds_two_numbers() {
+        assert_eq!(display_after("12+34="), "46");
+    }
+
+    #[test]
+    fn chains_operations_left_to_right() {
+        assert_eq!(display_after("2+3*4="), "20");
+    }
+
+    #[test]
+    fn hides_float_rounding_error() {
+        assert_eq!(display_after("0.1+0.2="), "0.3");
+    }
+
+    #[test]
+    fn divide_by_zero_shows_error() {
+        assert_eq!(display_after("5/0="), "Error");
+    }
+
+    #[test]
+    fn digit_after_error_starts_fresh() {
+        assert_eq!(display_after("5/0=7"), "7");
+        assert_eq!(display_after("5/0=7+1="), "8");
+    }
+
+    #[test]
+    fn clear_resets_everything() {
+        assert_eq!(display_after("12+3C"), "0");
+        assert_eq!(display_after("12+3C4="), "4");
+    }
+
+    #[test]
+    fn toggle_sign_on_result() {
+        assert_eq!(display_after("2+3=±"), "-5");
+    }
+
+    #[test]
+    fn percent_divides_by_hundred() {
+        assert_eq!(display_after("50%"), "0.5");
+    }
+
+    // ===== 버그 재현 (doc/bugAndFix.md) =====
+
+    // 버그 1: 연산자를 연속으로 누르면 연산자만 교체되어야 함
+    #[test]
+    fn bug1_consecutive_operators_replace_operator() {
+        assert_eq!(display_after("5+*"), "5");
+        assert_eq!(display_after("5+*3="), "15");
+    }
+
+    // 버그 2-A: ± 후에도 입력 중인 소수점이 유지되어야 함
+    #[test]
+    fn bug2a_toggle_sign_keeps_decimal_input() {
+        assert_eq!(display_after("1.±"), "-1.");
+        assert_eq!(display_after("1.±5"), "-1.5");
+    }
+
+    // 버그 2-B: % 결과가 정수여도 바로 소수점을 입력할 수 있어야 함
+    // (버그 3 수정 방침에 따라 % 뒤 입력은 새 입력으로 시작)
+    #[test]
+    fn bug2b_decimal_allowed_after_integer_percent() {
+        assert_eq!(display_after("500%"), "5");
+        assert_eq!(display_after("500%.5"), "0.5");
+    }
+
+    // 버그 3: % 결과 뒤 숫자 입력은 새 입력으로 시작해야 함
+    #[test]
+    fn bug3_digit_after_percent_starts_new_input() {
+        assert_eq!(display_after("50%3"), "3");
+    }
+
+    // 버그 4: -0이 표시되면 안 됨
+    #[test]
+    fn bug4_no_negative_zero() {
+        assert_eq!(display_after("0*5±="), "0");
+        assert_eq!(display_after("0/5±="), "0");
+    }
+
+    // 버그 5: 아주 크거나 작은 결과는 짧게(지수 표기로) 표시되어야 함
+    fn assert_compact_and_close(display: &str, expected: f64) {
+        assert!(
+            display.len() <= 16,
+            "표시가 너무 김 ({}자): {display}",
+            display.len()
+        );
+        let value: f64 = display
+            .parse()
+            .unwrap_or_else(|_| panic!("숫자로 해석 불가: {display}"));
+        let relative_error = ((value - expected) / expected).abs();
+        assert!(
+            relative_error < 1e-6,
+            "값이 다름: {display} (기대값 {expected:e})"
+        );
+    }
+
+    #[test]
+    fn bug5_huge_result_is_compact() {
+        let display = display_after("99999999*99999999*99999999=");
+        assert_compact_and_close(&display, 99999999f64.powi(3));
+    }
+
+    #[test]
+    fn bug5_tiny_result_is_not_rounded_to_zero() {
+        let display = display_after("0.00000001/1000=");
+        assert_compact_and_close(&display, 1e-11);
+    }
+
+    // 버그 6: 입력 자릿수는 최대 15자리로 제한되어야 함
+    #[test]
+    fn bug6_input_digits_are_limited() {
+        let display = display_after(&"9".repeat(30));
+        let digits = display.chars().filter(|c| c.is_ascii_digit()).count();
+        assert_eq!(digits, 15, "입력된 자릿수: {display}");
+    }
+
+    #[test]
+    fn bug6_digit_limit_excludes_sign_and_decimal() {
+        let keys = format!("1.{}", "2".repeat(30));
+        let display = display_after(&keys);
+        let digits = display.chars().filter(|c| c.is_ascii_digit()).count();
+        assert_eq!(digits, 15, "입력된 자릿수: {display}");
+        assert!(display.starts_with("1."));
+    }
+
+    // ===== 수정 과정에서 추가한 경계 사례 =====
+
+    // % 결과를 피연산자로 쓴 뒤 연산자를 눌러도 값이 버려지지 않아야 함
+    #[test]
+    fn percent_operand_is_kept_before_next_operator() {
+        assert_eq!(display_after("200+10%+"), "200.1");
+        assert_eq!(display_after("200+10%+5="), "205.1");
+    }
+
+    // = 결과에 이어서 연산자를 누르면 결과가 이전 값이 되어야 함
+    #[test]
+    fn operator_after_equals_uses_result() {
+        assert_eq!(display_after("2+3=*4="), "20");
+    }
+
+    #[test]
+    fn toggle_sign_on_zero_does_nothing() {
+        assert_eq!(display_after("±"), "0");
+    }
+
+    #[test]
+    fn toggle_sign_twice_restores_input() {
+        assert_eq!(display_after("1.5±±"), "1.5");
+    }
+
+    #[test]
+    fn decimal_input_still_allowed_once() {
+        assert_eq!(display_after("1.2.3"), "1.23");
+    }
+
+    #[test]
+    fn format_number_cases() {
+        assert_eq!(format_number(-0.0), "0");
+        assert_eq!(format_number(42.0), "42");
+        assert_eq!(format_number(-1.25), "-1.25");
+        assert_eq!(format_number(999_999_999_999_999.0), "999999999999999");
+        assert_eq!(format_number(1e15), "1e15");
+        assert_eq!(format_number(-1e-11), "-1e-11");
+        assert_eq!(format_number(1.23456789e-8), "1.23456789e-8");
+        assert_eq!(format_number(f64::INFINITY), "Error");
+        assert_eq!(format_number(f64::NAN), "Error");
+    }
+
+    // 지수 표기 결과로 이어서 계산할 수 있어야 함
+    #[test]
+    fn scientific_result_can_be_used_as_operand() {
+        assert_eq!(display_after("0.00000001/1000=*1000="), "1e-8");
+    }
 }
