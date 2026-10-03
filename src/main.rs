@@ -1,8 +1,8 @@
 use iced::{
-    Application, Command, Element, Length, Settings, Subscription, Theme,
-    keyboard::{self, KeyCode, Modifiers},
-    widget::{button, column, container, row, text},
-    Background, Color, Event,
+    alignment,
+    keyboard::{self, key::Named, Key, Modifiers},
+    widget::{button, column, container, row, text, Button},
+    Background, Border, Color, Element, Length, Subscription, Theme,
 };
 use num_bigint::BigInt;
 use num_rational::BigRational;
@@ -12,13 +12,12 @@ use num_traits::{ToPrimitive, Zero};
 type Number = BigRational;
 
 fn main() -> iced::Result {
-    Calculator::run(Settings {
-        window: iced::window::Settings {
-            size: (500, 600),
-            ..Default::default()
-        },
-        ..Default::default()
-    })
+    iced::application(Calculator::new, Calculator::update, Calculator::view)
+        .title("Calculator")
+        .theme(Theme::Dark)
+        .subscription(Calculator::subscription)
+        .window_size((500, 600))
+        .run()
 }
 
 // 연산자 타입 정의
@@ -58,10 +57,7 @@ enum ButtonType {
 
 #[derive(Debug, Clone)]
 enum Message {
-    ButtonPressed(ButtonType),
-    CharacterTyped(char),                  // 키보드로 입력된 문자
-    KeyPressed(KeyCode, Modifiers),        // Enter, Esc, Backspace 등 특수 키
-    ModifiersChanged(Modifiers),           // Cmd, Ctrl, Alt 등 상태 변경
+    ButtonPressed(ButtonType), // 버튼 클릭 또는 대응하는 키 입력
 }
 
 // 입력 가능한 최대 자릿수 (디스플레이 폭 한계)
@@ -74,8 +70,8 @@ const SCIENTIFIC_LOWER: f64 = 1e-7;
 // 레이아웃 크기
 const BUTTON_WIDTH: f32 = 100.0;
 const BUTTON_HEIGHT: f32 = 75.0;
-const SPACING: u16 = 10;
-const GRID_WIDTH: f32 = BUTTON_WIDTH * 4.0 + SPACING as f32 * 3.0;
+const SPACING: f32 = 10.0;
+const GRID_WIDTH: f32 = BUTTON_WIDTH * 4.0 + SPACING * 3.0;
 
 struct Calculator {
     display: String,               // 현재 표시할 값
@@ -86,10 +82,22 @@ struct Calculator {
     operator_just_pressed: bool,   // 직전 입력이 연산자였는지
     error: bool,                   // 에러 상태인지 (0으로 나누기, 오버플로)
     last_operation: Option<(Operator, Number)>, // = 반복용 마지막 연산과 오른쪽 피연산자
-    modifiers: Modifiers,          // 현재 눌린 보조 키
 }
 
 impl Calculator {
+    fn new() -> Self {
+        Calculator {
+            display: "0".to_string(),
+            result_value: None,
+            previous_value: None,
+            operator: None,
+            waiting_for_operand: false,
+            operator_just_pressed: false,
+            error: false,
+            last_operation: None,
+        }
+    }
+
     // 상태 초기화
     fn clear(&mut self) {
         self.display = "0".to_string();
@@ -450,14 +458,34 @@ fn char_to_button(c: char) -> Option<ButtonType> {
     Some(button_type)
 }
 
-// 특수 키를 버튼으로 변환 (문자로 들어오지 않는 키)
-fn key_code_to_button(key_code: KeyCode) -> Option<ButtonType> {
-    match key_code {
-        KeyCode::Enter | KeyCode::NumpadEnter => Some(ButtonType::Equals),
-        KeyCode::Escape => Some(ButtonType::AllClear),
-        KeyCode::Backspace => Some(ButtonType::Backspace),
+// 특수 키를 버튼으로 변환
+fn named_key_to_button(named: Named) -> Option<ButtonType> {
+    match named {
+        Named::Enter => Some(ButtonType::Equals),
+        Named::Escape => Some(ButtonType::AllClear),
+        Named::Backspace => Some(ButtonType::Backspace),
         _ => None,
     }
+}
+
+// 키 입력을 버튼으로 변환
+fn key_to_button(key: &Key, text: Option<&str>, modifiers: Modifiers) -> Option<ButtonType> {
+    if is_shortcut(modifiers) {
+        return None;
+    }
+    // Enter, Esc, Backspace는 키 이름 기준 (입력 문자가 "\r" 등이어도 중복 처리 안 됨)
+    if let Key::Named(named) = key {
+        if let Some(button_type) = named_key_to_button(*named) {
+            return Some(button_type);
+        }
+    }
+    // 그 외에는 실제 입력된 문자 기준 (키보드 배열 무관, 예: Shift+8 = '*')
+    let mut chars = text?.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    char_to_button(c)
 }
 
 // Cmd/Ctrl/Alt가 눌렸으면 단축키이므로 계산기 입력으로 처리하지 않음
@@ -470,74 +498,27 @@ fn count_digits(s: &str) -> usize {
     s.chars().filter(|c| c.is_ascii_digit()).count()
 }
 
-impl Application for Calculator {
-    type Message = Message;
-    type Theme = Theme;
-    type Executor = iced::executor::Default;
-    type Flags = ();
-
-    fn new(_flags: ()) -> (Self, Command<Message>) {
-        (
-            Calculator {
-                display: "0".to_string(),
-                result_value: None,
-                previous_value: None,
-                operator: None,
-                waiting_for_operand: false,
-                operator_just_pressed: false,
-                error: false,
-                last_operation: None,
-                modifiers: Modifiers::default(),
-            },
-            Command::none(),
-        )
-    }
-
-    fn title(&self) -> String {
-        String::from("Calculator")
-    }
-
-    fn update(&mut self, message: Message) -> Command<Message> {
+impl Calculator {
+    fn update(&mut self, message: Message) {
         match message {
             Message::ButtonPressed(button_type) => self.press(button_type),
-            Message::CharacterTyped(c) => {
-                if !is_shortcut(self.modifiers) {
-                    if let Some(button_type) = char_to_button(c) {
-                        self.press(button_type);
-                    }
-                }
-            }
-            Message::KeyPressed(key_code, modifiers) => {
-                if !is_shortcut(modifiers) {
-                    if let Some(button_type) = key_code_to_button(key_code) {
-                        self.press(button_type);
-                    }
-                }
-            }
-            Message::ModifiersChanged(modifiers) => self.modifiers = modifiers,
         }
-        Command::none()
     }
 
     // 키보드 이벤트 구독
     fn subscription(&self) -> Subscription<Message> {
-        iced::subscription::events_with(|event, status| {
+        iced::event::listen_with(|event, status, _window| {
             // 위젯이 이미 처리한 이벤트는 무시
             if status == iced::event::Status::Captured {
                 return None;
             }
-            match event {
-                Event::Keyboard(keyboard::Event::CharacterReceived(c)) => {
-                    Some(Message::CharacterTyped(c))
-                }
-                Event::Keyboard(keyboard::Event::KeyPressed { key_code, modifiers }) => {
-                    Some(Message::KeyPressed(key_code, modifiers))
-                }
-                Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
-                    Some(Message::ModifiersChanged(modifiers))
-                }
-                _ => None,
-            }
+            let iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                key, text, modifiers, ..
+            }) = event
+            else {
+                return None;
+            };
+            key_to_button(&key, text.as_deref(), modifiers).map(Message::ButtonPressed)
         })
     }
 
@@ -552,37 +533,12 @@ impl Application for Calculator {
         .spacing(SPACING);
 
         // 창 크기가 바뀌어도 계산기를 가운데에 배치
-        container(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x()
-            .center_y()
-            .into()
-    }
-
-    fn theme(&self) -> Theme {
-        Theme::Dark
+        container(content).center(Length::Fill).into()
     }
 }
 
 // 디스플레이 영역 컴포넌트 (개선: 긴 숫자 처리)
 fn display_area(value: &str, expression: String) -> Element<'_, Message> {
-    struct DisplayStyle;
-
-    impl container::StyleSheet for DisplayStyle {
-        type Style = Theme;
-
-        fn appearance(&self, _style: &Self::Style) -> container::Appearance {
-            container::Appearance {
-                background: Some(Background::Color(Color::from_rgb(0.15, 0.15, 0.15))),
-                border_color: Color::from_rgb(0.4, 0.4, 0.4),
-                border_width: 2.0,
-                border_radius: 10.0.into(),
-                ..Default::default()
-            }
-        }
-    }
-
     // 긴 숫자에 대해 폰트 크기 자동 조정
     let font_size = if value.len() > 12 {
         32.0
@@ -595,26 +551,35 @@ fn display_area(value: &str, expression: String) -> Element<'_, Message> {
     // 위: 대기 중인 수식 (작고 흐리게), 아래: 현재 값
     let expression = text(expression)
         .size(20)
-        .style(Color::from_rgb(0.6, 0.6, 0.6))
+        .color(Color::from_rgb(0.6, 0.6, 0.6))
         .width(Length::Fill)
-        .horizontal_alignment(iced::alignment::Horizontal::Right);
+        .align_x(alignment::Horizontal::Right);
 
     let value = text(value)
-        .size(font_size as u16)
+        .size(font_size)
         .width(Length::Fill)
         .height(Length::Fill)
-        .horizontal_alignment(iced::alignment::Horizontal::Right)
-        .vertical_alignment(iced::alignment::Vertical::Center);
+        .align_x(alignment::Horizontal::Right)
+        .align_y(alignment::Vertical::Center);
 
     container(column![expression, value])
         .width(Length::Fixed(GRID_WIDTH))
         .height(Length::Fixed(120.0))
         .padding([10, 20])
-        .style(iced::theme::Container::Custom(Box::new(DisplayStyle)))
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(Color::from_rgb(0.15, 0.15, 0.15))),
+            border: Border {
+                color: Color::from_rgb(0.4, 0.4, 0.4),
+                width: 2.0,
+                radius: 10.0.into(),
+            },
+            ..Default::default()
+        })
         .into()
 }
 
 // 버튼 스타일 타입
+#[derive(Clone, Copy)]
 enum ButtonStyleType {
     Number,    // 숫자 버튼
     Operator,  // 연산자 버튼
@@ -623,74 +588,53 @@ enum ButtonStyleType {
     Equals,    // = 버튼
 }
 
-// 버튼 스타일 시트
-struct ButtonStyle {
-    style_type: ButtonStyleType,
+// 버튼 스타일
+fn button_style(style_type: ButtonStyleType, status: button::Status) -> button::Style {
+    let (background, text_color) = match style_type {
+        ButtonStyleType::Number => {
+            // 숫자 버튼: 어두운 회색
+            (Color::from_rgb(0.3, 0.3, 0.3), Color::WHITE)
+        }
+        ButtonStyleType::Operator => {
+            // 연산자 버튼: 주황색
+            (Color::from_rgb(1.0, 0.6, 0.0), Color::WHITE)
+        }
+        ButtonStyleType::ActiveOperator => {
+            // 선택된 연산자 버튼: 색 반전 (흰 배경, 주황 글자)
+            (Color::WHITE, Color::from_rgb(1.0, 0.6, 0.0))
+        }
+        ButtonStyleType::Function => {
+            // 기능 버튼: 밝은 회색
+            (Color::from_rgb(0.5, 0.5, 0.5), Color::WHITE)
+        }
+        ButtonStyleType::Equals => {
+            // = 버튼: 파란색
+            (Color::from_rgb(0.0, 0.5, 1.0), Color::WHITE)
+        }
+    };
+
+    // 호버 시 약간 밝게, 눌렀을 때 약간 어둡게
+    let background = match status {
+        button::Status::Hovered => adjust_brightness(background, 0.1),
+        button::Status::Pressed => adjust_brightness(background, -0.1),
+        button::Status::Active | button::Status::Disabled => background,
+    };
+
+    button::Style {
+        background: Some(Background::Color(background)),
+        text_color,
+        border: Border::default().rounded(10),
+        ..Default::default()
+    }
 }
 
-impl button::StyleSheet for ButtonStyle {
-    type Style = Theme;
-
-    fn active(&self, _style: &Self::Style) -> button::Appearance {
-        let (background, text_color) = match self.style_type {
-            ButtonStyleType::Number => {
-                // 숫자 버튼: 어두운 회색
-                (Color::from_rgb(0.3, 0.3, 0.3), Color::WHITE)
-            }
-            ButtonStyleType::Operator => {
-                // 연산자 버튼: 주황색
-                (Color::from_rgb(1.0, 0.6, 0.0), Color::WHITE)
-            }
-            ButtonStyleType::ActiveOperator => {
-                // 선택된 연산자 버튼: 색 반전 (흰 배경, 주황 글자)
-                (Color::WHITE, Color::from_rgb(1.0, 0.6, 0.0))
-            }
-            ButtonStyleType::Function => {
-                // 기능 버튼: 밝은 회색
-                (Color::from_rgb(0.5, 0.5, 0.5), Color::WHITE)
-            }
-            ButtonStyleType::Equals => {
-                // = 버튼: 파란색
-                (Color::from_rgb(0.0, 0.5, 1.0), Color::WHITE)
-            }
-        };
-
-        button::Appearance {
-            background: Some(Background::Color(background)),
-            text_color,
-            border_radius: 10.0.into(),
-            border_width: 0.0,
-            border_color: Color::TRANSPARENT,
-            ..Default::default()
-        }
-    }
-
-    fn hovered(&self, style: &Self::Style) -> button::Appearance {
-        let mut appearance = self.active(style);
-        // 호버 시 약간 밝게
-        if let Some(Background::Color(color)) = appearance.background {
-            appearance.background = Some(Background::Color(Color {
-                r: (color.r + 0.1).min(1.0),
-                g: (color.g + 0.1).min(1.0),
-                b: (color.b + 0.1).min(1.0),
-                a: color.a,
-            }));
-        }
-        appearance
-    }
-
-    fn pressed(&self, style: &Self::Style) -> button::Appearance {
-        let mut appearance = self.active(style);
-        // 눌렀을 때 약간 어둡게
-        if let Some(Background::Color(color)) = appearance.background {
-            appearance.background = Some(Background::Color(Color {
-                r: (color.r - 0.1).max(0.0),
-                g: (color.g - 0.1).max(0.0),
-                b: (color.b - 0.1).max(0.0),
-                a: color.a,
-            }));
-        }
-        appearance
+// 색의 밝기를 조정 (0.0 ~ 1.0 범위 유지)
+fn adjust_brightness(color: Color, amount: f32) -> Color {
+    Color {
+        r: (color.r + amount).clamp(0.0, 1.0),
+        g: (color.g + amount).clamp(0.0, 1.0),
+        b: (color.b + amount).clamp(0.0, 1.0),
+        a: color.a,
     }
 }
 
@@ -745,7 +689,7 @@ fn button_grid(
         // 다섯 번째 행: 0 (버튼 2칸 + 간격), ., =
         row![
             calc_button("0", ButtonType::Number('0'), ButtonStyleType::Number)
-                .width(Length::Fixed(BUTTON_WIDTH * 2.0 + SPACING as f32)),
+                .width(Length::Fixed(BUTTON_WIDTH * 2.0 + SPACING)),
             calc_button(".", ButtonType::Decimal, ButtonStyleType::Number),
             calc_button("=", ButtonType::Equals, ButtonStyleType::Equals),
         ]
@@ -760,21 +704,18 @@ fn calc_button<'a>(
     label: &'a str,
     button_type: ButtonType,
     style_type: ButtonStyleType,
-) -> button::Button<'a, Message> {
+) -> Button<'a, Message> {
     // 라벨을 버튼 가운데에 배치
     let label = text(label)
         .size(28)
         .width(Length::Fill)
         .height(Length::Fill)
-        .horizontal_alignment(iced::alignment::Horizontal::Center)
-        .vertical_alignment(iced::alignment::Vertical::Center);
+        .center();
 
     button(label)
         .width(Length::Fixed(BUTTON_WIDTH))
         .height(Length::Fixed(BUTTON_HEIGHT))
-        .style(iced::theme::Button::Custom(Box::new(ButtonStyle {
-            style_type,
-        })))
+        .style(move |_theme, status| button_style(style_type, status))
         .on_press(Message::ButtonPressed(button_type))
 }
 
@@ -783,7 +724,7 @@ mod tests {
     use super::*;
 
     fn new_calc() -> Calculator {
-        Calculator::new(()).0
+        Calculator::new()
     }
 
     // 키 문자열을 버튼 입력으로 변환해 순서대로 누름
@@ -804,7 +745,7 @@ mod tests {
                 '⌫' => ButtonType::Backspace,
                 _ => panic!("알 수 없는 키: {key}"),
             };
-            let _ = calc.update(Message::ButtonPressed(button_type));
+            calc.update(Message::ButtonPressed(button_type));
         }
     }
 
@@ -1140,31 +1081,66 @@ mod tests {
         assert_eq!(char_to_button('a'), None);
     }
 
+    fn key(c: &str) -> Key {
+        Key::Character(c.into())
+    }
+
     #[test]
-    fn key_code_mapping() {
-        assert_eq!(key_code_to_button(KeyCode::Enter), Some(ButtonType::Equals));
-        assert_eq!(key_code_to_button(KeyCode::NumpadEnter), Some(ButtonType::Equals));
-        assert_eq!(key_code_to_button(KeyCode::Escape), Some(ButtonType::AllClear));
-        assert_eq!(key_code_to_button(KeyCode::Backspace), Some(ButtonType::Backspace));
-        // 숫자 키는 문자 입력으로 처리하므로 키 코드로는 매핑하지 않음
-        assert_eq!(key_code_to_button(KeyCode::Key1), None);
+    fn named_key_mapping() {
+        let none = Modifiers::default();
+        // 특수 키는 입력 문자("\r" 등)가 함께 와도 키 이름 기준으로 한 번만 처리
+        assert_eq!(key_to_button(&Key::Named(Named::Enter), Some("\r"), none), Some(ButtonType::Equals));
+        assert_eq!(key_to_button(&Key::Named(Named::Escape), Some("\u{1b}"), none), Some(ButtonType::AllClear));
+        assert_eq!(key_to_button(&Key::Named(Named::Backspace), Some("\u{8}"), none), Some(ButtonType::Backspace));
+        assert_eq!(key_to_button(&Key::Named(Named::Tab), Some("\t"), none), None);
+    }
+
+    #[test]
+    fn typed_text_mapping() {
+        let none = Modifiers::default();
+        assert_eq!(key_to_button(&key("7"), Some("7"), none), Some(ButtonType::Number('7')));
+        // Shift+8은 키는 '8'이지만 입력 문자는 '*'
+        assert_eq!(
+            key_to_button(&key("8"), Some("*"), Modifiers::SHIFT),
+            Some(ButtonType::Operator(Operator::Multiply))
+        );
+        assert_eq!(key_to_button(&key("a"), Some("a"), none), None);
+        assert_eq!(key_to_button(&key("a"), None, none), None);
+        assert_eq!(key_to_button(&key("ab"), Some("ab"), none), None);
+    }
+
+    #[test]
+    fn shortcuts_are_ignored() {
+        // Cmd+C(복사)가 C(초기화)로 처리되면 안 됨
+        assert_eq!(key_to_button(&key("c"), Some("c"), Modifiers::COMMAND), None);
+        assert_eq!(key_to_button(&key("5"), Some("5"), Modifiers::CTRL), None);
+        assert_eq!(key_to_button(&key("5"), Some("5"), Modifiers::ALT), None);
+        assert_eq!(key_to_button(&Key::Named(Named::Backspace), None, Modifiers::COMMAND), None);
+    }
+
+    // 키 입력을 구독과 같은 경로로 처리
+    fn send_key(calc: &mut Calculator, key: Key, text: Option<&str>) {
+        if let Some(button_type) = key_to_button(&key, text, Modifiers::default()) {
+            calc.update(Message::ButtonPressed(button_type));
+        }
     }
 
     fn type_chars(calc: &mut Calculator, chars: &str) {
         for c in chars.chars() {
-            let _ = calc.update(Message::CharacterTyped(c));
+            let c = c.to_string();
+            send_key(calc, key(&c), Some(&c));
         }
     }
 
-    fn press_key(calc: &mut Calculator, key_code: KeyCode) {
-        let _ = calc.update(Message::KeyPressed(key_code, Modifiers::default()));
+    fn press_key(calc: &mut Calculator, named: Named) {
+        send_key(calc, Key::Named(named), None);
     }
 
     #[test]
     fn keyboard_calculation() {
         let mut calc = new_calc();
         type_chars(&mut calc, "12*3");
-        press_key(&mut calc, KeyCode::Enter);
+        press_key(&mut calc, Named::Enter);
         assert_eq!(calc.display_text(), "36");
     }
 
@@ -1172,37 +1148,10 @@ mod tests {
     fn keyboard_backspace_and_escape() {
         let mut calc = new_calc();
         type_chars(&mut calc, "123");
-        press_key(&mut calc, KeyCode::Backspace);
+        press_key(&mut calc, Named::Backspace);
         assert_eq!(calc.display_text(), "12");
-        press_key(&mut calc, KeyCode::Escape);
+        press_key(&mut calc, Named::Escape);
         assert_eq!(calc.display_text(), "0");
-    }
-
-    #[test]
-    fn shortcuts_are_ignored() {
-        let mut calc = new_calc();
-        type_chars(&mut calc, "12");
-
-        // Cmd+C(복사)가 C(초기화)로 처리되면 안 됨
-        let _ = calc.update(Message::ModifiersChanged(Modifiers::COMMAND));
-        type_chars(&mut calc, "c");
-        let _ = calc.update(Message::KeyPressed(KeyCode::Backspace, Modifiers::COMMAND));
-        assert_eq!(calc.display_text(), "12");
-
-        // 보조 키를 떼면 다시 입력됨
-        let _ = calc.update(Message::ModifiersChanged(Modifiers::default()));
-        type_chars(&mut calc, "3");
-        assert_eq!(calc.display_text(), "123");
-    }
-
-    #[test]
-    fn shift_is_not_a_shortcut() {
-        // Shift+8 = '*', Shift+= = '+' 처럼 Shift는 문자 입력에 필요
-        let mut calc = new_calc();
-        let _ = calc.update(Message::ModifiersChanged(Modifiers::SHIFT));
-        type_chars(&mut calc, "6*7");
-        press_key(&mut calc, KeyCode::Enter);
-        assert_eq!(calc.display_text(), "42");
     }
 
     // ===== 선택된 연산자 표시 =====
@@ -1383,7 +1332,7 @@ mod tests {
     fn escape_always_clears_everything() {
         let mut calc = new_calc();
         type_chars(&mut calc, "12+3");
-        press_key(&mut calc, KeyCode::Escape);
+        press_key(&mut calc, Named::Escape);
         assert_eq!(calc.display_text(), "0");
         assert_eq!(calc.expression_text(), "");
     }
