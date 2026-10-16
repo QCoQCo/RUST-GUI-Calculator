@@ -1,17 +1,23 @@
 use iced::{
-    Application, Command, Element, Length, Settings, Theme,
-    widget::{button, column, container, row, text},
-    Background, Color,
+    alignment,
+    keyboard::{self, key::Named, key::Physical, Key, Modifiers},
+    widget::{button, column, container, row, text, Button},
+    Background, Border, Color, Element, Length, Subscription, Task, Theme,
 };
+use num_bigint::BigInt;
+use num_rational::BigRational;
+use num_traits::{ToPrimitive, Zero};
+
+// 계산에 쓰는 숫자: 분수로 정확하게 계산 (예: 1/3 × 3 = 1, 0.1 + 0.2 = 0.3)
+type Number = BigRational;
 
 fn main() -> iced::Result {
-    Calculator::run(Settings {
-        window: iced::window::Settings {
-            size: (500, 600),
-            ..Default::default()
-        },
-        ..Default::default()
-    })
+    iced::application(Calculator::new, Calculator::update, Calculator::view)
+        .title("Calculator")
+        .theme(Theme::Dark)
+        .subscription(Calculator::subscription)
+        .window_size((500, 600))
+        .run()
 }
 
 // 연산자 타입 정의
@@ -23,116 +29,256 @@ enum Operator {
     Divide,   // ÷
 }
 
+impl Operator {
+    // 화면에 표시할 기호
+    fn symbol(self) -> &'static str {
+        match self {
+            Operator::Add => "+",
+            Operator::Subtract => "-",
+            Operator::Multiply => "×",
+            Operator::Divide => "÷",
+        }
+    }
+}
+
 // 버튼 타입 정의
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum ButtonType {
     Number(char),        // 0-9
     Decimal,             // .
     Operator(Operator),  // +, -, ×, ÷
     Equals,              // =
-    Clear,               // C
+    Clear,               // C / AC (입력 중이면 현재 입력만, 아니면 전체 초기화)
+    AllClear,            // 전체 초기화 (키보드 Esc)
     Sign,                // ±
     Percent,             // %
+    Backspace,           // ⌫
 }
 
 #[derive(Debug, Clone)]
 enum Message {
-    ButtonPressed(ButtonType),
+    ButtonPressed(ButtonType), // 버튼 클릭 또는 대응하는 키 입력
+    Copy,                      // Cmd+C: 표시 중인 값을 클립보드로 복사
+    Paste,                     // Cmd+V: 클립보드 읽기 요청
+    Pasted(Option<String>),    // 클립보드에서 읽은 내용
 }
 
+// 입력 가능한 최대 자릿수 (디스플레이 폭 한계)
+const MAX_INPUT_DIGITS: usize = 15;
+
+// 이 범위를 벗어나는 값은 지수 표기로 표시
+const SCIENTIFIC_UPPER: f64 = 1e15;
+const SCIENTIFIC_LOWER: f64 = 1e-7;
+
+// 레이아웃 크기
+const BUTTON_WIDTH: f32 = 100.0;
+const BUTTON_HEIGHT: f32 = 75.0;
+const SPACING: f32 = 10.0;
+const GRID_WIDTH: f32 = BUTTON_WIDTH * 4.0 + SPACING * 3.0;
+
 struct Calculator {
-    display: String,              // 현재 표시할 값
-    previous_value: Option<f64>,  // 이전 값
-    operator: Option<Operator>,  // 현재 연산자
-    waiting_for_operand: bool,    // 새 피연산자 입력 대기 중인지
-    has_decimal: bool,           // 현재 입력값에 소수점이 있는지
+    display: String,               // 현재 표시할 값
+    result_value: Option<Number>,  // 표시 중인 계산 결과의 정확한 값 (새 입력 시 None)
+    previous_value: Option<Number>, // 이전 값
+    operator: Option<Operator>,    // 현재 연산자
+    waiting_for_operand: bool,     // 다음 숫자 입력 시 새로 시작하는지
+    operator_just_pressed: bool,   // 직전 입력이 연산자였는지
+    error: bool,                   // 에러 상태인지 (0으로 나누기, 오버플로)
+    last_operation: Option<(Operator, Number)>, // = 반복용 마지막 연산과 오른쪽 피연산자
+    last_equation: Option<String>, // = 직후 수식 줄에 보여줄 완료된 수식 (예: "5 + 3 =")
 }
 
 impl Calculator {
+    fn new() -> Self {
+        Calculator {
+            display: "0".to_string(),
+            result_value: None,
+            previous_value: None,
+            operator: None,
+            waiting_for_operand: false,
+            operator_just_pressed: false,
+            error: false,
+            last_operation: None,
+            last_equation: None,
+        }
+    }
+
     // 상태 초기화
     fn clear(&mut self) {
         self.display = "0".to_string();
+        self.result_value = None;
         self.previous_value = None;
         self.operator = None;
         self.waiting_for_operand = false;
-        self.has_decimal = false;
+        self.operator_just_pressed = false;
+        self.error = false;
+        self.last_operation = None;
+    }
+
+    // 입력 중인 숫자가 있는지 (C/AC 구분 기준)
+    fn has_entry(&self) -> bool {
+        !self.error && !self.waiting_for_operand && self.display != "0"
+    }
+
+    // C: 현재 입력만 지움 (걸려 있는 연산은 유지), AC: 전체 초기화
+    fn clear_entry_or_all(&mut self) {
+        if self.has_entry() {
+            self.display = "0".to_string();
+        } else {
+            self.clear();
+        }
+    }
+
+    // C/AC 버튼 라벨
+    fn clear_label(&self) -> &'static str {
+        if self.has_entry() {
+            "C"
+        } else {
+            "AC"
+        }
+    }
+
+    // 버튼(또는 대응하는 키) 입력 처리
+    fn press(&mut self, button_type: ButtonType) {
+        // Backspace는 지울 입력이 없으면 아무것도 하지 않으므로 상태를 유지
+        let operator_just_pressed = match button_type {
+            ButtonType::Operator(_) => true,
+            ButtonType::Backspace => self.operator_just_pressed,
+            _ => false,
+        };
+        // 완료된 수식은 다음 입력이 들어오면 지움 (= 는 새로 설정, Backspace는 결과를 지우지 않음)
+        if !matches!(button_type, ButtonType::Equals | ButtonType::Backspace) {
+            self.last_equation = None;
+        }
+        match button_type {
+            ButtonType::Clear => self.clear_entry_or_all(),
+            ButtonType::AllClear => self.clear(),
+            ButtonType::Number(digit) => self.input_number(digit),
+            ButtonType::Decimal => self.input_decimal(),
+            ButtonType::Operator(op) => self.input_operator(op),
+            ButtonType::Equals => self.execute_calculation(),
+            ButtonType::Sign => self.toggle_sign(),
+            ButtonType::Percent => self.calculate_percent(),
+            ButtonType::Backspace => self.backspace(),
+        }
+        self.operator_just_pressed = operator_just_pressed;
+    }
+
+    // 화면에 보여줄 문자열
+    fn display_text(&self) -> &str {
+        if self.error {
+            "Error"
+        } else {
+            &self.display
+        }
+    }
+
+    // 강조 표시할 연산자 (연산자를 누른 뒤 다음 숫자를 입력하기 전까지)
+    fn active_operator(&self) -> Option<Operator> {
+        if self.error || !self.waiting_for_operand {
+            return None;
+        }
+        self.operator
+    }
+
+    // 디스플레이 위쪽에 보여줄 수식
+    // 대기 중인 연산 (예: "5 ×") 또는 = 직후의 완료된 수식 (예: "5 + 3 =")
+    fn expression_text(&self) -> String {
+        match (self.error, &self.previous_value, self.operator) {
+            (false, Some(prev_val), Some(op)) => {
+                format!("{} {}", format_value(prev_val), op.symbol())
+            }
+            _ => self.last_equation.clone().unwrap_or_default(),
+        }
+    }
+
+    // Cmd+C로 복사할 문자열 (에러 상태면 None)
+    fn copy_text(&self) -> Option<String> {
+        if self.error {
+            return None;
+        }
+        // 입력 중인 "1." 같은 형태는 끝의 소수점을 빼고 복사
+        Some(self.display.trim_end_matches('.').to_string())
+    }
+
+    // Cmd+V로 붙여넣은 문자열이 숫자이면 직접 입력한 것처럼 넣음
+    fn paste(&mut self, text: &str) {
+        let Some(number) = normalize_pasted_number(text) else {
+            return;
+        };
+        if self.error {
+            self.clear();
+        }
+        self.display = number;
+        self.result_value = None;
+        self.waiting_for_operand = false;
+        self.operator_just_pressed = false;
+        self.last_equation = None;
     }
 
     // 디스플레이 값을 숫자로 변환
-    fn get_display_value(&self) -> f64 {
-        // Error 상태이면 0.0 반환
-        if self.display == "Error" {
-            return 0.0;
+    fn get_display_value(&self) -> Number {
+        // 계산 결과는 화면용으로 반올림되어 있으므로 정확한 값을 사용
+        if let Some(value) = &self.result_value {
+            return value.clone();
         }
-        self.display.parse().unwrap_or(0.0)
-    }
-
-    // Error 상태인지 확인
-    fn is_error(&self) -> bool {
-        self.display == "Error"
+        parse_number(&self.display)
     }
 
     // 디스플레이 업데이트 (숫자 포맷팅)
-    fn update_display(&mut self, value: f64) {
-        // 무한대나 NaN 체크
-        if value.is_infinite() || value.is_nan() {
-            self.display = "Error".to_string();
-            return;
-        }
-
-        // 소수점이 없고 정수인 경우 정수로 표시
-        if value.fract() == 0.0 {
-            self.display = value.trunc().to_string();
-        } else {
-            // 소수점이 있는 경우 최대 10자리까지 표시
-            self.display = format!("{:.10}", value)
-                .trim_end_matches('0')
-                .trim_end_matches('.')
-                .to_string();
-        }
+    fn update_display(&mut self, value: Number) {
+        self.display = format_value(&value);
+        self.result_value = Some(value);
     }
 
     // 숫자 입력 처리
     fn input_number(&mut self, digit: char) {
         // Error 상태이면 초기화
-        if self.is_error() {
+        if self.error {
             self.clear();
         }
+        // 새 입력이 시작되므로 이전 결과 값은 버림
+        self.result_value = None;
         
         if self.waiting_for_operand {
             self.display = digit.to_string();
             self.waiting_for_operand = false;
-            self.has_decimal = false;
-        } else {
-            if self.display == "0" {
-                self.display = digit.to_string();
-            } else {
-                self.display.push(digit);
-            }
+        } else if self.display == "0" {
+            self.display = digit.to_string();
+        } else if self.display == "-0" {
+            self.display = format!("-{digit}");
+        } else if count_digits(&self.display) < MAX_INPUT_DIGITS {
+            self.display.push(digit);
         }
     }
 
     // 소수점 입력 처리
     fn input_decimal(&mut self) {
         // Error 상태이면 초기화
-        if self.is_error() {
+        if self.error {
             self.clear();
         }
+        // 새 입력이 시작되므로 이전 결과 값은 버림
+        self.result_value = None;
         
         if self.waiting_for_operand {
             self.display = "0.".to_string();
             self.waiting_for_operand = false;
-            self.has_decimal = true;
-        } else if !self.has_decimal {
+        } else if !self.display.contains('.') {
             self.display.push('.');
-            self.has_decimal = true;
         }
     }
 
     // 연산자 입력 처리
     fn input_operator(&mut self, op: Operator) {
         // Error 상태이면 연산자 입력 무시
-        if self.is_error() {
+        if self.error {
+            return;
+        }
+
+        // 연산자를 연속으로 누르면 연산자만 교체
+        if self.operator_just_pressed && self.operator.is_some() {
+            self.operator = Some(op);
             return;
         }
         
@@ -140,14 +286,14 @@ impl Calculator {
 
         if let Some(prev_op) = self.operator {
             // 이전 연산자가 있으면 먼저 계산 실행
-            if let Some(prev_val) = self.previous_value {
-                let result = self.calculate(prev_val, prev_op, current_value);
-                self.update_display(result);
+            if let Some(prev_val) = &self.previous_value {
                 // Error가 발생하면 연산자 설정하지 않음
-                if self.is_error() {
+                let Some(result) = calculate(prev_val, prev_op, &current_value) else {
+                    self.error = true;
                     return;
-                }
-                self.previous_value = Some(result);
+                };
+                self.previous_value = Some(result.clone());
+                self.update_display(result);
             }
         } else {
             // 이전 연산자가 없으면 현재 값을 이전 값으로 저장
@@ -156,167 +302,362 @@ impl Calculator {
 
         self.operator = Some(op);
         self.waiting_for_operand = true;
-        self.has_decimal = false;
-    }
-
-    // 계산 실행
-    fn calculate(&self, left: f64, op: Operator, right: f64) -> f64 {
-        match op {
-            Operator::Add => left + right,
-            Operator::Subtract => left - right,
-            Operator::Multiply => left * right,
-            Operator::Divide => {
-                if right == 0.0 {
-                    f64::INFINITY // 0으로 나누기 에러
-                } else {
-                    left / right
-                }
-            }
-        }
     }
 
     // 계산 실행 (= 버튼)
     fn execute_calculation(&mut self) {
         // Error 상태이면 계산 실행 무시
-        if self.is_error() {
+        if self.error {
             return;
         }
         
-        if let Some(op) = self.operator {
-            if let Some(prev_val) = self.previous_value {
-                let current_value = self.get_display_value();
-                let result = self.calculate(prev_val, op, current_value);
+        let (left, op, right) =
+            if let (Some(op), Some(prev_val)) = (self.operator, &self.previous_value) {
+                (prev_val.clone(), op, self.get_display_value())
+            } else if let Some((op, right)) = &self.last_operation {
+                // = 반복: 마지막 연산을 현재 값에 다시 적용
+                (self.get_display_value(), *op, right.clone())
+            } else {
+                return;
+            };
+
+        // 계산한 수식을 수식 줄에 남김 (에러여도 원인을 알 수 있도록 표시)
+        self.last_equation = Some(format!(
+            "{} {} {} =",
+            format_value(&left),
+            op.symbol(),
+            format_value(&right)
+        ));
+
+        match calculate(&left, op, &right) {
+            Some(result) => {
                 self.update_display(result);
-                // Error가 발생하지 않았을 때만 상태 업데이트
-                if !self.is_error() {
-                    self.previous_value = None;
-                    self.operator = None;
-                    self.waiting_for_operand = true;
-                    self.has_decimal = result.fract() != 0.0;
-                }
+                self.previous_value = None;
+                self.operator = None;
+                self.waiting_for_operand = true;
+                self.last_operation = Some((op, right));
             }
+            None => self.error = true,
+        }
+    }
+
+    // 한 글자 지우기 (⌫)
+    fn backspace(&mut self) {
+        // 에러 또는 결과 표시 중이면 지울 입력이 없음
+        if self.error || self.waiting_for_operand {
+            return;
+        }
+
+        self.display.pop();
+        if matches!(self.display.as_str(), "" | "-" | "-0") {
+            self.display = "0".to_string();
         }
     }
 
     // 부호 변경 (±)
     fn toggle_sign(&mut self) {
         // Error 상태이면 무시
-        if self.is_error() {
+        if self.error {
+            return;
+        }
+
+        // 연산자 직후에는 음수 입력을 새로 시작 (예: 5 + ± → -0)
+        if self.operator_just_pressed {
+            self.display = "-0".to_string();
+            self.result_value = None;
+            self.waiting_for_operand = false;
             return;
         }
         
-        let value = self.get_display_value();
-        if value != 0.0 {
-            self.update_display(-value);
+        // 문자열에서 부호만 바꿔 입력 중인 형태(예: "1.")를 유지
+        if let Some(positive) = self.display.strip_prefix('-') {
+            self.display = positive.to_string();
+        } else if self.display != "0" {
+            self.display.insert(0, '-');
+        }
+        // 계산 결과를 표시 중이면 정확한 값의 부호도 변경
+        if let Some(value) = self.result_value.as_mut() {
+            *value = -&*value;
         }
     }
 
     // 퍼센트 계산 (%)
     fn calculate_percent(&mut self) {
         // Error 상태이면 무시
-        if self.is_error() {
+        if self.error {
             return;
         }
         
         let value = self.get_display_value();
-        self.update_display(value / 100.0);
-        // Error가 발생하지 않았을 때만 has_decimal 업데이트
-        if !self.is_error() {
-            self.has_decimal = true;
+        let hundred = Number::from_integer(BigInt::from(100));
+        // +, - 연산 중이면 앞 값 기준 (예: 200 + 10% → 20), 그 외에는 /100
+        let percent = match (self.operator, &self.previous_value) {
+            (Some(Operator::Add | Operator::Subtract), Some(prev_val)) => prev_val * value / hundred,
+            _ => value / hundred,
+        };
+        if !is_displayable(&percent) {
+            self.error = true;
+            return;
         }
+        self.update_display(percent);
+        // 결과 뒤 숫자 입력은 새 입력으로 시작
+        self.waiting_for_operand = true;
     }
 }
 
-impl Application for Calculator {
-    type Message = Message;
-    type Theme = Theme;
-    type Executor = iced::executor::Default;
-    type Flags = ();
+// 계산 실행 (0으로 나누기, 표시 범위 초과 시 None)
+fn calculate(left: &Number, op: Operator, right: &Number) -> Option<Number> {
+    let result = match op {
+        Operator::Add => left + right,
+        Operator::Subtract => left - right,
+        Operator::Multiply => left * right,
+        Operator::Divide => {
+            if right.is_zero() {
+                return None;
+            }
+            left / right
+        }
+    };
+    Some(result).filter(is_displayable)
+}
 
-    fn new(_flags: ()) -> (Self, Command<Message>) {
-        (
-            Calculator {
-                display: "0".to_string(),
-                previous_value: None,
-                operator: None,
-                waiting_for_operand: false,
-                has_decimal: false,
-            },
-            Command::none(),
-        )
+// 화면에 표시할 수 있는 크기인지 (f64 범위, 약 1.8e308 이내)
+fn is_displayable(value: &Number) -> bool {
+    to_display_f64(value).is_some()
+}
+
+// 표시용 f64로 변환 (범위를 넘으면 None)
+fn to_display_f64(value: &Number) -> Option<f64> {
+    value.to_f64().filter(|f| f.is_finite())
+}
+
+// 입력 문자열을 정확한 분수로 변환 (예: "-1.25" → -125/100)
+fn parse_number(s: &str) -> Number {
+    let (negative, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let (integer_part, fraction_part) = digits.split_once('.').unwrap_or((digits, ""));
+    let numerator: BigInt = format!("{integer_part}{fraction_part}").parse().unwrap_or_default();
+    let denominator = BigInt::from(10).pow(fraction_part.len() as u32);
+    let value = Number::new(numerator, denominator);
+    if negative {
+        -value
+    } else {
+        value
+    }
+}
+
+// 계산 값을 디스플레이용 문자열로 변환
+fn format_value(value: &Number) -> String {
+    format_number(to_display_f64(value).expect("계산 결과는 항상 표시 범위 안"))
+}
+
+// 숫자를 디스플레이용 문자열로 변환 (유한한 값만 받음)
+fn format_number(value: f64) -> String {
+    debug_assert!(value.is_finite(), "유한하지 않은 값: {value}");
+
+    // -0.0도 "0"으로 표시
+    if value == 0.0 {
+        return "0".to_string();
     }
 
-    fn title(&self) -> String {
-        String::from("Calculator")
+    let abs = value.abs();
+    if abs >= SCIENTIFIC_UPPER || abs < SCIENTIFIC_LOWER {
+        // 지수 표기: 가수 최대 9자리, 끝의 0 제거 (예: 9.9999997e23)
+        let formatted = format!("{:.8e}", value);
+        let (mantissa, exponent) = formatted
+            .split_once('e')
+            .expect("지수 표기에는 항상 'e'가 있음");
+        let mantissa = mantissa.trim_end_matches('0').trim_end_matches('.');
+        format!("{mantissa}e{exponent}")
+    } else if value.fract() == 0.0 {
+        // 정수인 경우 정수로 표시
+        value.to_string()
+    } else {
+        // 소수점이 있는 경우 최대 10자리까지 표시
+        format!("{:.10}", value)
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    }
+}
+
+// 키보드 문자를 버튼으로 변환
+fn char_to_button(c: char) -> Option<ButtonType> {
+    let button_type = match c {
+        '0'..='9' => ButtonType::Number(c),
+        '.' | ',' => ButtonType::Decimal,
+        '+' => ButtonType::Operator(Operator::Add),
+        '-' => ButtonType::Operator(Operator::Subtract),
+        '*' | 'x' | 'X' | '×' => ButtonType::Operator(Operator::Multiply),
+        '/' | '÷' => ButtonType::Operator(Operator::Divide),
+        '=' => ButtonType::Equals,
+        '%' => ButtonType::Percent,
+        'c' | 'C' => ButtonType::Clear,
+        _ => return None,
+    };
+    Some(button_type)
+}
+
+// 특수 키를 버튼으로 변환
+fn named_key_to_button(named: Named) -> Option<ButtonType> {
+    match named {
+        Named::Enter => Some(ButtonType::Equals),
+        Named::Escape => Some(ButtonType::AllClear),
+        Named::Backspace => Some(ButtonType::Backspace),
+        _ => None,
+    }
+}
+
+// 키 입력을 버튼으로 변환
+fn key_to_button(key: &Key, text: Option<&str>, modifiers: Modifiers) -> Option<ButtonType> {
+    if is_shortcut(modifiers) {
+        return None;
+    }
+    // Enter, Esc, Backspace는 키 이름 기준 (입력 문자가 "\r" 등이어도 중복 처리 안 됨)
+    if let Key::Named(named) = key {
+        if let Some(button_type) = named_key_to_button(*named) {
+            return Some(button_type);
+        }
+    }
+    // 그 외에는 실제 입력된 문자 기준 (키보드 배열 무관, 예: Shift+8 = '*')
+    let mut chars = text?.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    char_to_button(c)
+}
+
+// Cmd/Ctrl/Alt가 눌렸으면 단축키이므로 계산기 입력으로 처리하지 않음
+fn is_shortcut(modifiers: Modifiers) -> bool {
+    modifiers.logo() || modifiers.control() || modifiers.alt()
+}
+
+// 클립보드 단축키 (Cmd+C / Cmd+V, macOS 외에는 Ctrl)
+// 한글 입력 상태에서도 동작하도록 물리 키 위치로 판별
+fn clipboard_shortcut(key: &Key, physical_key: Physical, modifiers: Modifiers) -> Option<Message> {
+    if !modifiers.command() || modifiers.alt() || modifiers.shift() {
+        return None;
+    }
+    match key.to_latin(physical_key)? {
+        'c' => Some(Message::Copy),
+        'v' => Some(Message::Paste),
+        _ => None,
+    }
+}
+
+// 키 입력을 메시지로 변환
+fn key_to_message(
+    key: &Key,
+    physical_key: Physical,
+    text: Option<&str>,
+    modifiers: Modifiers,
+) -> Option<Message> {
+    clipboard_shortcut(key, physical_key, modifiers)
+        .or_else(|| key_to_button(key, text, modifiers).map(Message::ButtonPressed))
+}
+
+// 붙여넣은 문자열을 입력 형태로 정리 (숫자가 아니거나 자릿수 초과면 None)
+// 예: " -007.50 " → "-7.50", ".5" → "0.5"
+fn normalize_pasted_number(text: &str) -> Option<String> {
+    let text = text.trim();
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let (integer_part, fraction_part) = match digits.split_once('.') {
+        Some((integer_part, fraction_part)) => (integer_part, Some(fraction_part)),
+        None => (digits, None),
+    };
+
+    let all_digits = |s: &str| s.chars().all(|c| c.is_ascii_digit());
+    if !all_digits(integer_part) || !fraction_part.is_none_or(all_digits) {
+        return None;
+    }
+    if integer_part.is_empty() && fraction_part.is_none_or(str::is_empty) {
+        return None;
     }
 
-    fn update(&mut self, message: Message) -> Command<Message> {
+    let integer_part = match integer_part.trim_start_matches('0') {
+        "" => "0",
+        trimmed => trimmed,
+    };
+    let mut number = integer_part.to_string();
+    if let Some(fraction_part) = fraction_part {
+        number.push('.');
+        number.push_str(fraction_part);
+    }
+    if count_digits(&number) > MAX_INPUT_DIGITS {
+        return None;
+    }
+    // 0이 아닐 때만 음수 부호 유지
+    if negative && number.chars().any(|c| matches!(c, '1'..='9')) {
+        number.insert(0, '-');
+    }
+    Some(number)
+}
+
+// 문자열에 포함된 숫자 자릿수 (부호, 소수점 제외)
+fn count_digits(s: &str) -> usize {
+    s.chars().filter(|c| c.is_ascii_digit()).count()
+}
+
+impl Calculator {
+    fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::ButtonPressed(button_type) => {
-                match button_type {
-                    ButtonType::Clear => {
-                        self.clear();
-                    }
-                    ButtonType::Number(digit) => {
-                        self.input_number(digit);
-                    }
-                    ButtonType::Decimal => {
-                        self.input_decimal();
-                    }
-                    ButtonType::Operator(op) => {
-                        self.input_operator(op);
-                    }
-                    ButtonType::Equals => {
-                        self.execute_calculation();
-                    }
-                    ButtonType::Sign => {
-                        self.toggle_sign();
-                    }
-                    ButtonType::Percent => {
-                        self.calculate_percent();
-                    }
+            Message::ButtonPressed(button_type) => self.press(button_type),
+            Message::Copy => {
+                if let Some(text) = self.copy_text() {
+                    return iced::clipboard::write(text);
                 }
             }
+            Message::Paste => return iced::clipboard::read().map(Message::Pasted),
+            Message::Pasted(Some(text)) => self.paste(&text),
+            Message::Pasted(None) => {}
         }
-        Command::none()
+        Task::none()
+    }
+
+    // 키보드 이벤트 구독
+    fn subscription(&self) -> Subscription<Message> {
+        iced::event::listen_with(|event, status, _window| {
+            // 위젯이 이미 처리한 이벤트는 무시
+            if status == iced::event::Status::Captured {
+                return None;
+            }
+            let iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                physical_key,
+                text,
+                modifiers,
+                ..
+            }) = event
+            else {
+                return None;
+            };
+            key_to_message(&key, physical_key, text.as_deref(), modifiers)
+        })
     }
 
     fn view(&self) -> Element<'_, Message> {
         // 메인 컬럼: 디스플레이 + 버튼 그리드
-        column![
+        let content = column![
             // 디스플레이 영역
-            display_area(&self.display),
+            display_area(self.display_text(), self.expression_text()),
             // 버튼 그리드
-            button_grid()
+            button_grid(self.active_operator(), self.clear_label())
         ]
-        .spacing(10)
-        .padding(20)
-        .into()
-    }
+        .spacing(SPACING);
 
-    fn theme(&self) -> Theme {
-        Theme::Dark
+        // 창 크기가 바뀌어도 계산기를 가운데에 배치
+        container(content).center(Length::Fill).into()
     }
 }
 
 // 디스플레이 영역 컴포넌트 (개선: 긴 숫자 처리)
-fn display_area(value: &str) -> Element<'_, Message> {
-    struct DisplayStyle;
-
-    impl container::StyleSheet for DisplayStyle {
-        type Style = Theme;
-
-        fn appearance(&self, _style: &Self::Style) -> container::Appearance {
-            container::Appearance {
-                background: Some(Background::Color(Color::from_rgb(0.15, 0.15, 0.15))),
-                border_color: Color::from_rgb(0.4, 0.4, 0.4),
-                border_width: 2.0,
-                border_radius: 10.0.into(),
-                ..Default::default()
-            }
-        }
-    }
-
+fn display_area(value: &str, expression: String) -> Element<'_, Message> {
     // 긴 숫자에 대해 폰트 크기 자동 조정
     let font_size = if value.len() > 12 {
         32.0
@@ -326,139 +667,157 @@ fn display_area(value: &str) -> Element<'_, Message> {
         48.0
     };
 
-    container(
-        text(value)
-            .size(font_size as u16)
-            .width(Length::Fill)
-            .horizontal_alignment(iced::alignment::Horizontal::Right),
-    )
-    .width(Length::Fill)
-    .height(Length::Fixed(120.0))
-    .padding(20)
-    .style(iced::theme::Container::Custom(Box::new(DisplayStyle)))
-    .into()
+    // 긴 수식(예: "-123456789012345 × 1.5e300 =")은 한 줄에 들어가도록 작게
+    let expression_size = if expression.chars().count() > 28 { 14.0 } else { 20.0 };
+
+    // 위: 수식 (작고 흐리게), 아래: 현재 값
+    let expression = text(expression)
+        .size(expression_size)
+        .color(Color::from_rgb(0.6, 0.6, 0.6))
+        .width(Length::Fill)
+        .align_x(alignment::Horizontal::Right);
+
+    let value = text(value)
+        .size(font_size)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(alignment::Horizontal::Right)
+        .align_y(alignment::Vertical::Center);
+
+    container(column![expression, value])
+        .width(Length::Fixed(GRID_WIDTH))
+        .height(Length::Fixed(120.0))
+        .padding([10, 20])
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(Color::from_rgb(0.15, 0.15, 0.15))),
+            border: Border {
+                color: Color::from_rgb(0.4, 0.4, 0.4),
+                width: 2.0,
+                radius: 10.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
 }
 
 // 버튼 스타일 타입
+#[derive(Clone, Copy)]
 enum ButtonStyleType {
     Number,    // 숫자 버튼
     Operator,  // 연산자 버튼
+    ActiveOperator, // 선택된 연산자 버튼
     Function,  // 기능 버튼 (C, ±, %)
     Equals,    // = 버튼
 }
 
-// 버튼 스타일 시트
-struct ButtonStyle {
-    style_type: ButtonStyleType,
+// 버튼 스타일
+fn button_style(style_type: ButtonStyleType, status: button::Status) -> button::Style {
+    let (background, text_color) = match style_type {
+        ButtonStyleType::Number => {
+            // 숫자 버튼: 어두운 회색
+            (Color::from_rgb(0.3, 0.3, 0.3), Color::WHITE)
+        }
+        ButtonStyleType::Operator => {
+            // 연산자 버튼: 주황색
+            (Color::from_rgb(1.0, 0.6, 0.0), Color::WHITE)
+        }
+        ButtonStyleType::ActiveOperator => {
+            // 선택된 연산자 버튼: 색 반전 (흰 배경, 주황 글자)
+            (Color::WHITE, Color::from_rgb(1.0, 0.6, 0.0))
+        }
+        ButtonStyleType::Function => {
+            // 기능 버튼: 밝은 회색
+            (Color::from_rgb(0.5, 0.5, 0.5), Color::WHITE)
+        }
+        ButtonStyleType::Equals => {
+            // = 버튼: 파란색
+            (Color::from_rgb(0.0, 0.5, 1.0), Color::WHITE)
+        }
+    };
+
+    // 호버 시 약간 밝게, 눌렀을 때 약간 어둡게
+    let background = match status {
+        button::Status::Hovered => adjust_brightness(background, 0.1),
+        button::Status::Pressed => adjust_brightness(background, -0.1),
+        button::Status::Active | button::Status::Disabled => background,
+    };
+
+    button::Style {
+        background: Some(Background::Color(background)),
+        text_color,
+        border: Border::default().rounded(10),
+        ..Default::default()
+    }
 }
 
-impl button::StyleSheet for ButtonStyle {
-    type Style = Theme;
-
-    fn active(&self, _style: &Self::Style) -> button::Appearance {
-        let (background, text_color) = match self.style_type {
-            ButtonStyleType::Number => {
-                // 숫자 버튼: 어두운 회색
-                (Color::from_rgb(0.3, 0.3, 0.3), Color::WHITE)
-            }
-            ButtonStyleType::Operator => {
-                // 연산자 버튼: 주황색
-                (Color::from_rgb(1.0, 0.6, 0.0), Color::WHITE)
-            }
-            ButtonStyleType::Function => {
-                // 기능 버튼: 밝은 회색
-                (Color::from_rgb(0.5, 0.5, 0.5), Color::WHITE)
-            }
-            ButtonStyleType::Equals => {
-                // = 버튼: 파란색
-                (Color::from_rgb(0.0, 0.5, 1.0), Color::WHITE)
-            }
-        };
-
-        button::Appearance {
-            background: Some(Background::Color(background)),
-            text_color,
-            border_radius: 10.0.into(),
-            border_width: 0.0,
-            border_color: Color::TRANSPARENT,
-            ..Default::default()
-        }
-    }
-
-    fn hovered(&self, style: &Self::Style) -> button::Appearance {
-        let mut appearance = self.active(style);
-        // 호버 시 약간 밝게
-        if let Some(Background::Color(color)) = appearance.background {
-            appearance.background = Some(Background::Color(Color {
-                r: (color.r + 0.1).min(1.0),
-                g: (color.g + 0.1).min(1.0),
-                b: (color.b + 0.1).min(1.0),
-                a: color.a,
-            }));
-        }
-        appearance
-    }
-
-    fn pressed(&self, style: &Self::Style) -> button::Appearance {
-        let mut appearance = self.active(style);
-        // 눌렀을 때 약간 어둡게
-        if let Some(Background::Color(color)) = appearance.background {
-            appearance.background = Some(Background::Color(Color {
-                r: (color.r - 0.1).max(0.0),
-                g: (color.g - 0.1).max(0.0),
-                b: (color.b - 0.1).max(0.0),
-                a: color.a,
-            }));
-        }
-        appearance
+// 색의 밝기를 조정 (0.0 ~ 1.0 범위 유지)
+fn adjust_brightness(color: Color, amount: f32) -> Color {
+    Color {
+        r: (color.r + amount).clamp(0.0, 1.0),
+        g: (color.g + amount).clamp(0.0, 1.0),
+        b: (color.b + amount).clamp(0.0, 1.0),
+        a: color.a,
     }
 }
 
 // 버튼 그리드 레이아웃
-fn button_grid() -> Element<'static, Message> {
+fn button_grid(
+    active_operator: Option<Operator>,
+    clear_label: &'static str,
+) -> Element<'static, Message> {
+    // 연산자 버튼 (선택된 연산자는 강조)
+    let operator_button = |op: Operator| {
+        let style_type = if active_operator == Some(op) {
+            ButtonStyleType::ActiveOperator
+        } else {
+            ButtonStyleType::Operator
+        };
+        calc_button(op.symbol(), ButtonType::Operator(op), style_type)
+    };
+
     column![
-        // 첫 번째 행: C, ±, %, ÷
+        // 첫 번째 행: C(AC), ⌫, %, ÷
         row![
-            calc_button("C", ButtonType::Clear, ButtonStyleType::Function),
-            calc_button("±", ButtonType::Sign, ButtonStyleType::Function),
+            calc_button(clear_label, ButtonType::Clear, ButtonStyleType::Function),
+            calc_button("⌫", ButtonType::Backspace, ButtonStyleType::Function),
             calc_button("%", ButtonType::Percent, ButtonStyleType::Function),
-            calc_button("÷", ButtonType::Operator(Operator::Divide), ButtonStyleType::Operator),
+            operator_button(Operator::Divide),
         ]
-        .spacing(10),
+        .spacing(SPACING),
         // 두 번째 행: 7, 8, 9, ×
         row![
             calc_button("7", ButtonType::Number('7'), ButtonStyleType::Number),
             calc_button("8", ButtonType::Number('8'), ButtonStyleType::Number),
             calc_button("9", ButtonType::Number('9'), ButtonStyleType::Number),
-            calc_button("×", ButtonType::Operator(Operator::Multiply), ButtonStyleType::Operator),
+            operator_button(Operator::Multiply),
         ]
-        .spacing(10),
+        .spacing(SPACING),
         // 세 번째 행: 4, 5, 6, -
         row![
             calc_button("4", ButtonType::Number('4'), ButtonStyleType::Number),
             calc_button("5", ButtonType::Number('5'), ButtonStyleType::Number),
             calc_button("6", ButtonType::Number('6'), ButtonStyleType::Number),
-            calc_button("-", ButtonType::Operator(Operator::Subtract), ButtonStyleType::Operator),
+            operator_button(Operator::Subtract),
         ]
-        .spacing(10),
+        .spacing(SPACING),
         // 네 번째 행: 1, 2, 3, +
         row![
             calc_button("1", ButtonType::Number('1'), ButtonStyleType::Number),
             calc_button("2", ButtonType::Number('2'), ButtonStyleType::Number),
             calc_button("3", ButtonType::Number('3'), ButtonStyleType::Number),
-            calc_button("+", ButtonType::Operator(Operator::Add), ButtonStyleType::Operator),
+            operator_button(Operator::Add),
         ]
-        .spacing(10),
-        // 다섯 번째 행: 0 (넓게), ., =
+        .spacing(SPACING),
+        // 다섯 번째 행: ±, 0, ., =
         row![
-            calc_button("0", ButtonType::Number('0'), ButtonStyleType::Number)
-                .width(Length::Fill),
+            calc_button("±", ButtonType::Sign, ButtonStyleType::Function),
+            calc_button("0", ButtonType::Number('0'), ButtonStyleType::Number),
             calc_button(".", ButtonType::Decimal, ButtonStyleType::Number),
             calc_button("=", ButtonType::Equals, ButtonStyleType::Equals),
         ]
-        .spacing(10),
+        .spacing(SPACING),
     ]
-    .spacing(10)
+    .spacing(SPACING)
     .into()
 }
 
@@ -467,12 +826,819 @@ fn calc_button<'a>(
     label: &'a str,
     button_type: ButtonType,
     style_type: ButtonStyleType,
-) -> button::Button<'a, Message> {
-    button(text(label).size(28))
-        .width(Length::Fixed(100.0))
-        .height(Length::Fixed(75.0))
-        .style(iced::theme::Button::Custom(Box::new(ButtonStyle {
-            style_type,
-        })))
+) -> Button<'a, Message> {
+    // 라벨을 버튼 가운데에 배치
+    let label = text(label)
+        .size(28)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center();
+
+    button(label)
+        .width(Length::Fixed(BUTTON_WIDTH))
+        .height(Length::Fixed(BUTTON_HEIGHT))
+        .style(move |_theme, status| button_style(style_type, status))
         .on_press(Message::ButtonPressed(button_type))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_calc() -> Calculator {
+        Calculator::new()
+    }
+
+    // 키 문자열을 버튼 입력으로 변환해 순서대로 누름
+    // 0-9 . + - * / = C ± % ⌫
+    fn press(calc: &mut Calculator, keys: &str) {
+        for key in keys.chars() {
+            let button_type = match key {
+                '0'..='9' => ButtonType::Number(key),
+                '.' => ButtonType::Decimal,
+                '+' => ButtonType::Operator(Operator::Add),
+                '-' => ButtonType::Operator(Operator::Subtract),
+                '*' => ButtonType::Operator(Operator::Multiply),
+                '/' => ButtonType::Operator(Operator::Divide),
+                '=' => ButtonType::Equals,
+                'C' => ButtonType::Clear,
+                '±' => ButtonType::Sign,
+                '%' => ButtonType::Percent,
+                '⌫' => ButtonType::Backspace,
+                _ => panic!("알 수 없는 키: {key}"),
+            };
+            let _ = calc.update(Message::ButtonPressed(button_type));
+        }
+    }
+
+    fn display_after(keys: &str) -> String {
+        let mut calc = new_calc();
+        press(&mut calc, keys);
+        calc.display_text().to_string()
+    }
+
+    // ===== 기존 동작 (회귀 방지) =====
+
+    #[test]
+    fn adds_two_numbers() {
+        assert_eq!(display_after("12+34="), "46");
+    }
+
+    #[test]
+    fn chains_operations_left_to_right() {
+        assert_eq!(display_after("2+3*4="), "20");
+    }
+
+    #[test]
+    fn hides_float_rounding_error() {
+        assert_eq!(display_after("0.1+0.2="), "0.3");
+    }
+
+    #[test]
+    fn divide_by_zero_shows_error() {
+        assert_eq!(display_after("5/0="), "Error");
+    }
+
+    #[test]
+    fn digit_after_error_starts_fresh() {
+        assert_eq!(display_after("5/0=7"), "7");
+        assert_eq!(display_after("5/0=7+1="), "8");
+    }
+
+    #[test]
+    fn clear_resets_everything() {
+        // C(입력 지움) 후 AC(전체 초기화)
+        assert_eq!(display_after("12+3CC"), "0");
+        assert_eq!(display_after("12+3CC4="), "4");
+    }
+
+    #[test]
+    fn toggle_sign_on_result() {
+        assert_eq!(display_after("2+3=±"), "-5");
+    }
+
+    #[test]
+    fn percent_divides_by_hundred() {
+        assert_eq!(display_after("50%"), "0.5");
+    }
+
+    // ===== 버그 재현 (doc/bugAndFix.md) =====
+
+    // 버그 1: 연산자를 연속으로 누르면 연산자만 교체되어야 함
+    #[test]
+    fn bug1_consecutive_operators_replace_operator() {
+        assert_eq!(display_after("5+*"), "5");
+        assert_eq!(display_after("5+*3="), "15");
+    }
+
+    // 버그 2-A: ± 후에도 입력 중인 소수점이 유지되어야 함
+    #[test]
+    fn bug2a_toggle_sign_keeps_decimal_input() {
+        assert_eq!(display_after("1.±"), "-1.");
+        assert_eq!(display_after("1.±5"), "-1.5");
+    }
+
+    // 버그 2-B: % 결과가 정수여도 바로 소수점을 입력할 수 있어야 함
+    // (버그 3 수정 방침에 따라 % 뒤 입력은 새 입력으로 시작)
+    #[test]
+    fn bug2b_decimal_allowed_after_integer_percent() {
+        assert_eq!(display_after("500%"), "5");
+        assert_eq!(display_after("500%.5"), "0.5");
+    }
+
+    // 버그 3: % 결과 뒤 숫자 입력은 새 입력으로 시작해야 함
+    #[test]
+    fn bug3_digit_after_percent_starts_new_input() {
+        assert_eq!(display_after("50%3"), "3");
+    }
+
+    // 버그 4: -0이 표시되면 안 됨
+    #[test]
+    fn bug4_no_negative_zero() {
+        assert_eq!(display_after("0*5±="), "0");
+        assert_eq!(display_after("0/5±="), "0");
+    }
+
+    // 버그 5: 아주 크거나 작은 결과는 짧게(지수 표기로) 표시되어야 함
+    fn assert_compact_and_close(display: &str, expected: f64) {
+        assert!(
+            display.len() <= 16,
+            "표시가 너무 김 ({}자): {display}",
+            display.len()
+        );
+        let value: f64 = display
+            .parse()
+            .unwrap_or_else(|_| panic!("숫자로 해석 불가: {display}"));
+        let relative_error = ((value - expected) / expected).abs();
+        assert!(
+            relative_error < 1e-6,
+            "값이 다름: {display} (기대값 {expected:e})"
+        );
+    }
+
+    #[test]
+    fn bug5_huge_result_is_compact() {
+        let display = display_after("99999999*99999999*99999999=");
+        assert_compact_and_close(&display, 99999999f64.powi(3));
+    }
+
+    #[test]
+    fn bug5_tiny_result_is_not_rounded_to_zero() {
+        let display = display_after("0.00000001/1000=");
+        assert_compact_and_close(&display, 1e-11);
+    }
+
+    // 버그 6: 입력 자릿수는 최대 15자리로 제한되어야 함
+    #[test]
+    fn bug6_input_digits_are_limited() {
+        let display = display_after(&"9".repeat(30));
+        let digits = display.chars().filter(|c| c.is_ascii_digit()).count();
+        assert_eq!(digits, 15, "입력된 자릿수: {display}");
+    }
+
+    #[test]
+    fn bug6_digit_limit_excludes_sign_and_decimal() {
+        let keys = format!("1.{}", "2".repeat(30));
+        let display = display_after(&keys);
+        let digits = display.chars().filter(|c| c.is_ascii_digit()).count();
+        assert_eq!(digits, 15, "입력된 자릿수: {display}");
+        assert!(display.starts_with("1."));
+    }
+
+    // ===== 수정 과정에서 추가한 경계 사례 =====
+
+    // % 결과를 피연산자로 쓴 뒤 연산자를 눌러도 값이 버려지지 않아야 함
+    #[test]
+    fn percent_operand_is_kept_before_next_operator() {
+        assert_eq!(display_after("200+10%+"), "220");
+        assert_eq!(display_after("200+10%+5="), "225");
+    }
+
+    // = 결과에 이어서 연산자를 누르면 결과가 이전 값이 되어야 함
+    #[test]
+    fn operator_after_equals_uses_result() {
+        assert_eq!(display_after("2+3=*4="), "20");
+    }
+
+    #[test]
+    fn toggle_sign_on_zero_does_nothing() {
+        assert_eq!(display_after("±"), "0");
+    }
+
+    #[test]
+    fn toggle_sign_twice_restores_input() {
+        assert_eq!(display_after("1.5±±"), "1.5");
+    }
+
+    #[test]
+    fn decimal_input_still_allowed_once() {
+        assert_eq!(display_after("1.2.3"), "1.23");
+    }
+
+    #[test]
+    fn format_number_cases() {
+        assert_eq!(format_number(-0.0), "0");
+        assert_eq!(format_number(42.0), "42");
+        assert_eq!(format_number(-1.25), "-1.25");
+        assert_eq!(format_number(999_999_999_999_999.0), "999999999999999");
+        assert_eq!(format_number(1e15), "1e15");
+        assert_eq!(format_number(-1e-11), "-1e-11");
+        assert_eq!(format_number(1.23456789e-8), "1.23456789e-8");
+    }
+
+    // 지수 표기 결과로 이어서 계산할 수 있어야 함
+    #[test]
+    fn scientific_result_can_be_used_as_operand() {
+        assert_eq!(display_after("0.00000001/1000=*1000="), "1e-8");
+    }
+
+    // ===== 에러 상태 (4단계) =====
+
+    fn num(s: &str) -> Number {
+        parse_number(s)
+    }
+
+    #[test]
+    fn calculate_rejects_divide_by_zero_and_overflow() {
+        assert_eq!(calculate(&num("6"), Operator::Divide, &num("3")), Some(num("2")));
+        assert_eq!(calculate(&num("1"), Operator::Divide, &num("0")), None);
+        // 1e300 × 1e10 = 1e310은 표시 범위(약 1.8e308)를 넘음
+        let huge = Number::from_integer(BigInt::from(10).pow(300));
+        assert_eq!(calculate(&huge, Operator::Multiply, &num("10000000000")), None);
+        assert!(calculate(&huge, Operator::Multiply, &num("100")).is_some());
+    }
+
+    #[test]
+    fn overflow_shows_error() {
+        // 약 1e15를 21번 곱하면 약 1e315로 f64 범위(약 1.8e308)를 넘음
+        let operands = vec!["999999999999999"; 21].join("*");
+        assert_eq!(display_after(&format!("{operands}=")), "Error");
+        // 연산자를 누르는 시점에 넘쳐도 Error
+        assert_eq!(display_after(&format!("{operands}*")), "Error");
+    }
+
+    #[test]
+    fn divide_by_zero_mid_chain_shows_error() {
+        assert_eq!(display_after("5/0+"), "Error");
+    }
+
+    #[test]
+    fn inputs_except_digit_and_clear_are_ignored_in_error() {
+        assert_eq!(display_after("5/0=+±%="), "Error");
+    }
+
+    #[test]
+    fn decimal_after_error_starts_fresh() {
+        assert_eq!(display_after("5/0=.5"), "0.5");
+    }
+
+    #[test]
+    fn clear_recovers_from_error() {
+        assert_eq!(display_after("5/0=C"), "0");
+        assert_eq!(display_after("5/0=C2+3="), "5");
+    }
+
+    // ===== = 반복 (5단계) =====
+
+    #[test]
+    fn equals_repeats_last_operation() {
+        assert_eq!(display_after("5+3==="), "14");
+        assert_eq!(display_after("10-2=="), "6");
+        assert_eq!(display_after("2*3=="), "18");
+        assert_eq!(display_after("81/3=="), "9");
+    }
+
+    #[test]
+    fn equals_right_after_operator_uses_same_value() {
+        assert_eq!(display_after("5+="), "10");
+        assert_eq!(display_after("5+=="), "15");
+    }
+
+    #[test]
+    fn equals_repeat_applies_to_new_input() {
+        assert_eq!(display_after("5+3=10="), "13");
+    }
+
+    #[test]
+    fn equals_without_operation_does_nothing() {
+        assert_eq!(display_after("7="), "7");
+        assert_eq!(display_after("7=="), "7");
+    }
+
+    #[test]
+    fn clear_forgets_last_operation() {
+        assert_eq!(display_after("5+3=C="), "0");
+        assert_eq!(display_after("5+3=C7="), "7");
+    }
+
+    #[test]
+    fn new_operation_replaces_last_operation() {
+        assert_eq!(display_after("5+3=*2=="), "32");
+    }
+
+    #[test]
+    fn equals_repeat_can_hit_error() {
+        assert_eq!(display_after("5/0=="), "Error");
+        let operands = vec!["999999999999999"; 20].join("*");
+        // 약 1e300에 1e15를 한 번 더 곱하면 오버플로
+        assert_eq!(display_after(&format!("{operands}=")), "1e300");
+        assert_eq!(display_after(&format!("{operands}=*999999999999999=")), "Error");
+    }
+
+    // ===== Backspace (5단계) =====
+
+    #[test]
+    fn backspace_removes_last_character() {
+        assert_eq!(display_after("123⌫"), "12");
+        assert_eq!(display_after("1.5⌫"), "1.");
+        assert_eq!(display_after("1.⌫"), "1");
+    }
+
+    #[test]
+    fn backspace_to_empty_shows_zero() {
+        assert_eq!(display_after("5⌫"), "0");
+        assert_eq!(display_after("⌫"), "0");
+        assert_eq!(display_after("12±⌫⌫"), "0");
+        assert_eq!(display_after("0.±⌫"), "0");
+    }
+
+    #[test]
+    fn backspace_then_continue_typing() {
+        assert_eq!(display_after("129⌫3+1="), "124");
+    }
+
+    #[test]
+    fn backspace_does_not_edit_result() {
+        assert_eq!(display_after("2+3=⌫"), "5");
+        assert_eq!(display_after("50%⌫"), "0.5");
+    }
+
+    #[test]
+    fn backspace_after_operator_keeps_operator_replacement() {
+        assert_eq!(display_after("5+⌫"), "5");
+        assert_eq!(display_after("5+⌫*3="), "15");
+    }
+
+    #[test]
+    fn backspace_ignored_in_error() {
+        assert_eq!(display_after("5/0=⌫"), "Error");
+    }
+
+    // ===== 키보드 입력 (5단계) =====
+
+    #[test]
+    fn char_mapping() {
+        assert_eq!(char_to_button('7'), Some(ButtonType::Number('7')));
+        assert_eq!(char_to_button('.'), Some(ButtonType::Decimal));
+        assert_eq!(char_to_button(','), Some(ButtonType::Decimal));
+        assert_eq!(char_to_button('*'), Some(ButtonType::Operator(Operator::Multiply)));
+        assert_eq!(char_to_button('x'), Some(ButtonType::Operator(Operator::Multiply)));
+        assert_eq!(char_to_button('/'), Some(ButtonType::Operator(Operator::Divide)));
+        assert_eq!(char_to_button('='), Some(ButtonType::Equals));
+        assert_eq!(char_to_button('c'), Some(ButtonType::Clear));
+        // Enter, Backspace가 문자로도 들어오는 경우 중복 처리되지 않아야 함
+        assert_eq!(char_to_button('\r'), None);
+        assert_eq!(char_to_button('\u{7f}'), None);
+        assert_eq!(char_to_button('\u{8}'), None);
+        assert_eq!(char_to_button('a'), None);
+    }
+
+    fn key(c: &str) -> Key {
+        Key::Character(c.into())
+    }
+
+    #[test]
+    fn named_key_mapping() {
+        let none = Modifiers::default();
+        // 특수 키는 입력 문자("\r" 등)가 함께 와도 키 이름 기준으로 한 번만 처리
+        assert_eq!(key_to_button(&Key::Named(Named::Enter), Some("\r"), none), Some(ButtonType::Equals));
+        assert_eq!(key_to_button(&Key::Named(Named::Escape), Some("\u{1b}"), none), Some(ButtonType::AllClear));
+        assert_eq!(key_to_button(&Key::Named(Named::Backspace), Some("\u{8}"), none), Some(ButtonType::Backspace));
+        assert_eq!(key_to_button(&Key::Named(Named::Tab), Some("\t"), none), None);
+    }
+
+    #[test]
+    fn typed_text_mapping() {
+        let none = Modifiers::default();
+        assert_eq!(key_to_button(&key("7"), Some("7"), none), Some(ButtonType::Number('7')));
+        // Shift+8은 키는 '8'이지만 입력 문자는 '*'
+        assert_eq!(
+            key_to_button(&key("8"), Some("*"), Modifiers::SHIFT),
+            Some(ButtonType::Operator(Operator::Multiply))
+        );
+        assert_eq!(key_to_button(&key("a"), Some("a"), none), None);
+        assert_eq!(key_to_button(&key("a"), None, none), None);
+        assert_eq!(key_to_button(&key("ab"), Some("ab"), none), None);
+    }
+
+    #[test]
+    fn shortcuts_are_ignored() {
+        // Cmd+C(복사)가 C(초기화)로 처리되면 안 됨
+        assert_eq!(key_to_button(&key("c"), Some("c"), Modifiers::COMMAND), None);
+        assert_eq!(key_to_button(&key("5"), Some("5"), Modifiers::CTRL), None);
+        assert_eq!(key_to_button(&key("5"), Some("5"), Modifiers::ALT), None);
+        assert_eq!(key_to_button(&Key::Named(Named::Backspace), None, Modifiers::COMMAND), None);
+    }
+
+    // 키 입력을 구독과 같은 경로로 처리
+    fn send_key(calc: &mut Calculator, key: Key, text: Option<&str>) {
+        if let Some(button_type) = key_to_button(&key, text, Modifiers::default()) {
+            let _ = calc.update(Message::ButtonPressed(button_type));
+        }
+    }
+
+    fn type_chars(calc: &mut Calculator, chars: &str) {
+        for c in chars.chars() {
+            let c = c.to_string();
+            send_key(calc, key(&c), Some(&c));
+        }
+    }
+
+    fn press_key(calc: &mut Calculator, named: Named) {
+        send_key(calc, Key::Named(named), None);
+    }
+
+    #[test]
+    fn keyboard_calculation() {
+        let mut calc = new_calc();
+        type_chars(&mut calc, "12*3");
+        press_key(&mut calc, Named::Enter);
+        assert_eq!(calc.display_text(), "36");
+    }
+
+    #[test]
+    fn keyboard_backspace_and_escape() {
+        let mut calc = new_calc();
+        type_chars(&mut calc, "123");
+        press_key(&mut calc, Named::Backspace);
+        assert_eq!(calc.display_text(), "12");
+        press_key(&mut calc, Named::Escape);
+        assert_eq!(calc.display_text(), "0");
+    }
+
+    // ===== 선택된 연산자 표시 =====
+
+    fn state_after(keys: &str) -> Calculator {
+        let mut calc = new_calc();
+        press(&mut calc, keys);
+        calc
+    }
+
+    #[test]
+    fn operator_is_highlighted_until_next_input() {
+        assert_eq!(state_after("5+").active_operator(), Some(Operator::Add));
+        assert_eq!(state_after("5+3").active_operator(), None);
+        assert_eq!(state_after("5+.").active_operator(), None);
+        assert_eq!(state_after("5").active_operator(), None);
+    }
+
+    #[test]
+    fn highlight_follows_replaced_operator() {
+        assert_eq!(state_after("5+*").active_operator(), Some(Operator::Multiply));
+        assert_eq!(state_after("5+3*").active_operator(), Some(Operator::Multiply));
+        // Backspace는 지울 입력이 없으므로 강조 유지
+        assert_eq!(state_after("5+⌫").active_operator(), Some(Operator::Add));
+    }
+
+    #[test]
+    fn no_highlight_after_equals_clear_or_error() {
+        assert_eq!(state_after("5+3=").active_operator(), None);
+        assert_eq!(state_after("5+C").active_operator(), None);
+        assert_eq!(state_after("5/0+").active_operator(), None);
+    }
+
+    #[test]
+    fn expression_shows_pending_operation() {
+        assert_eq!(state_after("5+").expression_text(), "5 +");
+        // 다음 숫자를 입력하는 중에도 유지
+        assert_eq!(state_after("5+3").expression_text(), "5 +");
+        // 연속 계산 시 중간 결과로 갱신
+        assert_eq!(state_after("5+3*").expression_text(), "8 ×");
+        assert_eq!(state_after("8/").expression_text(), "8 ÷");
+        assert_eq!(state_after("8-").expression_text(), "8 -");
+        assert_eq!(state_after("50%+").expression_text(), "0.5 +");
+    }
+
+    #[test]
+    fn expression_follows_replaced_operator() {
+        assert_eq!(state_after("5+*").expression_text(), "5 ×");
+    }
+
+    #[test]
+    fn expression_is_empty_without_pending_operation() {
+        assert_eq!(state_after("").expression_text(), "");
+        assert_eq!(state_after("5").expression_text(), "");
+        assert_eq!(state_after("5+C").expression_text(), "");
+    }
+
+    // ===== 버그 8: = 결과를 이어서 계산할 때 정밀도 유지 =====
+
+    #[test]
+    fn bug8_result_keeps_precision_for_next_operation() {
+        assert_eq!(display_after("1/3=*3="), "1");
+        assert_eq!(display_after("2/3=*3="), "2");
+    }
+
+    #[test]
+    fn bug8_equals_repeat_keeps_precision() {
+        assert_eq!(display_after("10/3==*9="), "10");
+    }
+
+    #[test]
+    fn bug8_percent_result_keeps_precision() {
+        assert_eq!(display_after("10/3=%*300="), "10");
+    }
+
+    #[test]
+    fn bug8_toggle_sign_keeps_precision() {
+        assert_eq!(display_after("1/3=±*3="), "-1");
+        assert_eq!(display_after("1/3=±±*3="), "1");
+    }
+
+    #[test]
+    fn bug8_new_input_replaces_result() {
+        assert_eq!(display_after("1/3=5*3="), "15");
+        assert_eq!(display_after("1/3=.5*2="), "1");
+    }
+
+    // 원래 값을 쓰더라도 부동소수점 오차는 결과에 남지 않아야 함
+    #[test]
+    fn float_noise_does_not_leak_into_results() {
+        assert_eq!(display_after("0.1+0.2=-0.3="), "0");
+        assert_eq!(display_after("0.1+0.2-0.3="), "0");
+        assert_eq!(display_after("0.1*3=-0.3="), "0");
+        assert_eq!(display_after("1.1*1.1=-1.21="), "0");
+    }
+
+    #[test]
+    fn parse_number_is_exact() {
+        assert_eq!(num("0"), Number::zero());
+        assert_eq!(num("-0"), Number::zero());
+        assert_eq!(num("1.25"), Number::new(BigInt::from(5), BigInt::from(4)));
+        assert_eq!(num("-1.25"), Number::new(BigInt::from(-5), BigInt::from(4)));
+        assert_eq!(num("0.1") + num("0.2"), num("0.3"));
+        // 입력 중인 형태도 처리
+        assert_eq!(num("1."), num("1"));
+        assert_eq!(num("-0."), Number::zero());
+    }
+
+    // ===== 유리수 계산: 나눗셈 결과도 정확 =====
+
+    #[test]
+    fn division_results_are_exact() {
+        assert_eq!(display_after("1/3=*3=-1="), "0");
+        assert_eq!(display_after("1/3*3-1="), "0");
+        assert_eq!(display_after("1/7=*7="), "1");
+    }
+
+    #[test]
+    fn repeated_division_and_multiplication_round_trip() {
+        // 3으로 10번 나눈 뒤 3으로 10번 곱하면 원래 값
+        let keys = format!("10/3{}*3{}", "=".repeat(10), "=".repeat(10));
+        assert_eq!(display_after(&keys), "10");
+    }
+
+    // ===== 문맥 퍼센트 =====
+
+    #[test]
+    fn percent_with_add_or_subtract_uses_previous_value() {
+        assert_eq!(display_after("200+10%"), "20");
+        assert_eq!(display_after("200+10%="), "220");
+        assert_eq!(display_after("200-10%="), "180");
+        // 피연산자 없이 %를 누르면 앞 값 자신을 기준으로 계산
+        assert_eq!(display_after("200+%"), "400");
+    }
+
+    #[test]
+    fn percent_with_multiply_or_divide_divides_by_hundred() {
+        assert_eq!(display_after("200*10%"), "0.1");
+        assert_eq!(display_after("200*10%="), "20");
+        assert_eq!(display_after("200/10%="), "2000");
+    }
+
+    #[test]
+    fn percent_without_operator_divides_by_hundred() {
+        assert_eq!(display_after("5+3=%"), "0.08");
+    }
+
+    // ===== C / AC =====
+
+    #[test]
+    fn clear_label_depends_on_entry() {
+        assert_eq!(state_after("").clear_label(), "AC");
+        assert_eq!(state_after("5").clear_label(), "C");
+        assert_eq!(state_after("5+").clear_label(), "AC");
+        assert_eq!(state_after("5+3").clear_label(), "C");
+        assert_eq!(state_after("5+3C").clear_label(), "AC");
+        assert_eq!(state_after("5+3=").clear_label(), "AC");
+        assert_eq!(state_after("5/0=").clear_label(), "AC");
+    }
+
+    #[test]
+    fn clear_entry_keeps_pending_operation() {
+        assert_eq!(display_after("12+3C"), "0");
+        assert_eq!(display_after("12+3C4="), "16");
+        assert_eq!(state_after("12+3C").expression_text(), "12 +");
+    }
+
+    #[test]
+    fn all_clear_when_no_entry() {
+        assert_eq!(state_after("12+C").expression_text(), "");
+        assert_eq!(display_after("12+C4="), "4");
+        assert_eq!(display_after("5+3=C="), "0");
+    }
+
+    #[test]
+    fn escape_always_clears_everything() {
+        let mut calc = new_calc();
+        type_chars(&mut calc, "12+3");
+        press_key(&mut calc, Named::Escape);
+        assert_eq!(calc.display_text(), "0");
+        assert_eq!(calc.expression_text(), "");
+    }
+
+    // ===== 연산자 직후 ± =====
+
+    #[test]
+    fn sign_after_operator_starts_negative_input() {
+        assert_eq!(display_after("5+±"), "-0");
+        assert_eq!(display_after("5+±3"), "-3");
+        assert_eq!(display_after("5+±3="), "2");
+        assert_eq!(display_after("5*±2="), "-10");
+        assert_eq!(display_after("5+±.5="), "4.5");
+        // 이전 값과 수식은 그대로
+        assert_eq!(state_after("5+±").expression_text(), "5 +");
+    }
+
+    #[test]
+    fn sign_twice_after_operator_cancels() {
+        assert_eq!(display_after("5+±±"), "0");
+        assert_eq!(display_after("5+±±3="), "8");
+    }
+
+    #[test]
+    fn sign_on_percent_result_negates_it() {
+        assert_eq!(display_after("200+10%±="), "180");
+    }
+
+    #[test]
+    fn backspace_on_negative_zero() {
+        assert_eq!(display_after("5+±⌫"), "0");
+    }
+
+    // ===== = 직후 완료된 수식 표시 =====
+
+    #[test]
+    fn equals_shows_completed_equation() {
+        assert_eq!(state_after("5+3=").expression_text(), "5 + 3 =");
+        assert_eq!(state_after("12*1.5=").expression_text(), "12 × 1.5 =");
+        // 연산자 직후 = 는 같은 값을 한 번 더 사용
+        assert_eq!(state_after("5+=").expression_text(), "5 + 5 =");
+    }
+
+    #[test]
+    fn repeated_equals_shows_actual_equation() {
+        assert_eq!(state_after("5+3==").expression_text(), "8 + 3 =");
+        assert_eq!(state_after("5+3=10=").expression_text(), "10 + 3 =");
+    }
+
+    #[test]
+    fn equation_shows_cause_of_error() {
+        assert_eq!(state_after("5/0=").expression_text(), "5 ÷ 0 =");
+    }
+
+    #[test]
+    fn equation_is_cleared_by_next_input() {
+        assert_eq!(state_after("5+3=7").expression_text(), "");
+        assert_eq!(state_after("5+3=±").expression_text(), "");
+        assert_eq!(state_after("5+3=%").expression_text(), "");
+        assert_eq!(state_after("5+3=C").expression_text(), "");
+        // 다음 연산자를 누르면 대기 중인 연산 표시로 바뀜
+        assert_eq!(state_after("5+3=*").expression_text(), "8 ×");
+    }
+
+    #[test]
+    fn backspace_keeps_equation_on_result() {
+        // 결과 표시 중에는 Backspace가 아무것도 지우지 않으므로 수식도 유지
+        assert_eq!(state_after("5+3=⌫").expression_text(), "5 + 3 =");
+    }
+
+    // ===== 복사 / 붙여넣기 =====
+
+    #[test]
+    fn copy_text_is_displayed_value() {
+        assert_eq!(state_after("5+3=").copy_text().as_deref(), Some("8"));
+        assert_eq!(state_after("1/3=").copy_text().as_deref(), Some("0.3333333333"));
+        assert_eq!(state_after("12").copy_text().as_deref(), Some("12"));
+        // 입력 중인 끝 소수점은 빼고 복사
+        assert_eq!(state_after("1.").copy_text().as_deref(), Some("1"));
+        assert_eq!(state_after("5/0=").copy_text(), None);
+    }
+
+    #[test]
+    fn normalize_pasted_numbers() {
+        assert_eq!(normalize_pasted_number("42").as_deref(), Some("42"));
+        assert_eq!(normalize_pasted_number(" -007.50 \n").as_deref(), Some("-7.50"));
+        assert_eq!(normalize_pasted_number(".5").as_deref(), Some("0.5"));
+        assert_eq!(normalize_pasted_number("3.").as_deref(), Some("3."));
+        assert_eq!(normalize_pasted_number("-0").as_deref(), Some("0"));
+        assert_eq!(normalize_pasted_number(&"9".repeat(15)).as_deref(), Some("999999999999999"));
+    }
+
+    #[test]
+    fn reject_non_numbers_when_pasting() {
+        for text in ["", "-", ".", "abc", "1,234", "1.2.3", "1e5", "--1", "+3", "12 34"] {
+            assert_eq!(normalize_pasted_number(text), None, "{text:?}");
+        }
+        // 15자리 초과
+        assert_eq!(normalize_pasted_number(&"9".repeat(16)), None);
+    }
+
+    #[test]
+    fn paste_works_like_typing() {
+        let mut calc = state_after("5+");
+        calc.paste("1.5");
+        assert_eq!(calc.display_text(), "1.5");
+        press(&mut calc, "=");
+        assert_eq!(calc.display_text(), "6.5");
+
+        // 붙여넣은 뒤 이어서 입력 가능
+        let mut calc = new_calc();
+        calc.paste("12");
+        press(&mut calc, "3");
+        assert_eq!(calc.display_text(), "123");
+    }
+
+    #[test]
+    fn paste_replaces_result_and_recovers_from_error() {
+        let mut calc = state_after("5+3=");
+        calc.paste("7");
+        press(&mut calc, "*2=");
+        assert_eq!(calc.display_text(), "14");
+
+        let mut calc = state_after("5/0=");
+        calc.paste("7");
+        assert_eq!(calc.display_text(), "7");
+        assert_eq!(calc.expression_text(), "");
+    }
+
+    #[test]
+    fn invalid_paste_changes_nothing() {
+        let mut calc = state_after("5+3");
+        calc.paste("hello");
+        assert_eq!(calc.display_text(), "3");
+        assert_eq!(calc.expression_text(), "5 +");
+    }
+
+    #[test]
+    fn paste_after_operator_counts_as_operand() {
+        // 연산자 직후 붙여넣으면 피연산자가 들어온 것이므로 다음 연산자는 계산을 수행
+        let mut calc = state_after("5+");
+        calc.paste("3");
+        press(&mut calc, "*");
+        assert_eq!(calc.expression_text(), "8 ×");
+    }
+
+    // ===== 클립보드 단축키 =====
+
+    fn code(code: keyboard::key::Code) -> Physical {
+        Physical::Code(code)
+    }
+
+    #[test]
+    fn clipboard_shortcuts() {
+        use keyboard::key::Code;
+        let cmd = Modifiers::COMMAND;
+        assert!(matches!(
+            key_to_message(&key("c"), code(Code::KeyC), Some("c"), cmd),
+            Some(Message::Copy)
+        ));
+        assert!(matches!(
+            key_to_message(&key("v"), code(Code::KeyV), Some("v"), cmd),
+            Some(Message::Paste)
+        ));
+        // 한글 입력 상태 (ㅊ = C 키, ㅍ = V 키)
+        assert!(matches!(
+            key_to_message(&key("ㅊ"), code(Code::KeyC), Some("ㅊ"), cmd),
+            Some(Message::Copy)
+        ));
+        assert!(matches!(
+            key_to_message(&key("ㅍ"), code(Code::KeyV), Some("ㅍ"), cmd),
+            Some(Message::Paste)
+        ));
+    }
+
+    #[test]
+    fn other_shortcuts_are_still_ignored() {
+        use keyboard::key::Code;
+        let cmd = Modifiers::COMMAND;
+        // Cmd+X, Cmd+Shift+C, Cmd+Alt+V, 보조 키 없는 c
+        assert!(key_to_message(&key("x"), code(Code::KeyX), Some("x"), cmd).is_none());
+        assert!(key_to_message(&key("C"), code(Code::KeyC), Some("C"), cmd | Modifiers::SHIFT).is_none());
+        assert!(key_to_message(&key("v"), code(Code::KeyV), Some("v"), cmd | Modifiers::ALT).is_none());
+        assert!(matches!(
+            key_to_message(&key("c"), code(Code::KeyC), Some("c"), Modifiers::default()),
+            Some(Message::ButtonPressed(ButtonType::Clear))
+        ));
+    }
 }

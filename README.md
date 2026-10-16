@@ -34,7 +34,7 @@ Rust와 Iced 프레임워크를 사용하여 개발된 데스크톱 GUI 계산�
 #### 실행 방법
 ```bash
 # 프로젝트 디렉토리로 이동
-cd gui_calculator
+cd RUST-GUI-Calculator
 
 # 실행
 cargo run
@@ -58,7 +58,7 @@ cargo build --release
 
 ### 프로젝트 구조
 ```
-gui_calculator/
+RUST-GUI-Calculator/
 ├── src/
 │   └── main.rs          # 메인 애플리케이션 코드
 ├── demo/                # 데모 스크린샷
@@ -111,7 +111,7 @@ RustとIcedフレームワークを使用して開発されたデスクトップ
 #### 実行方法
 ```bash
 # プロジェクトディレクトリに移動
-cd gui_calculator
+cd RUST-GUI-Calculator
 
 # 実行
 cargo run
@@ -135,7 +135,7 @@ cargo build --release
 
 ### プロジェクト構造
 ```
-gui_calculator/
+RUST-GUI-Calculator/
 ├── src/
 │   └── main.rs          # メインアプリケーションコード
 ├── demo/                # デモスクリーンショット
